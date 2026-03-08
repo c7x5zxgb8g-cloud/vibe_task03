@@ -1,0 +1,11 @@
+{
+  "feedbacks": [
+    {
+      "session_id": "test123",
+      "message_index": 0,
+      "rating": "bad",
+      "comment": "回复太长了",
+      "timestamp": "2026-03-07T22:29:45.414549"
+    }
+  ]
+}

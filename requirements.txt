@@ -18,6 +18,7 @@ tiktoken>=0.7.0
 # Web server
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
 
 # CLI & Config
 python-dotenv>=1.0.0

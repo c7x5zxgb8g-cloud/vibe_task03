@@ -30,4 +30,5 @@ class Config:
         "docx": [".docx", ".doc"],
         "excel": [".xlsx", ".xls", ".csv"],
         "image": [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"],
+        "txt": [".txt"],
     }

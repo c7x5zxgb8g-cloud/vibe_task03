@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from openai import OpenAI
@@ -15,6 +16,13 @@ logger = get_logger(__name__)
 # ── Load soul.md at module level ─────────────────────────────────
 
 _SOUL_PATH = os.path.join(os.path.dirname(__file__), "soul.md")
+_FEEDBACK_RULES_PATH = os.path.join(os.path.dirname(__file__), "feedback_rules.json")
+
+# Materials directory
+_MATERIALS_DIR = os.path.join(os.path.dirname(__file__), "docs", "理博基金知识库")
+
+# Shareable file extensions
+_SHAREABLE_EXTENSIONS = {".pdf", ".docx", ".doc", ".xlsx", ".xls", ".pptx", ".ppt", ".txt"}
 
 
 def _load_soul() -> str:
@@ -24,6 +32,36 @@ def _load_soul() -> str:
     except FileNotFoundError:
         logger.warning(f"soul.md not found at {_SOUL_PATH}, using fallback prompt")
         return ""
+
+
+def _load_feedback_rules() -> list[str]:
+    """Load active feedback rules from JSON file."""
+    try:
+        if os.path.exists(_FEEDBACK_RULES_PATH):
+            with open(_FEEDBACK_RULES_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return [r["rule"] for r in data.get("rules", []) if r.get("active", True)]
+    except Exception as e:
+        logger.warning(f"Failed to load feedback rules: {e}")
+    return []
+
+
+def get_available_materials() -> list[dict]:
+    """Return list of shareable materials from the knowledge base directory."""
+    materials = []
+    if not os.path.isdir(_MATERIALS_DIR):
+        return materials
+    for f in sorted(os.listdir(_MATERIALS_DIR)):
+        ext = os.path.splitext(f)[1].lower()
+        if ext in _SHAREABLE_EXTENSIONS:
+            fpath = os.path.join(_MATERIALS_DIR, f)
+            size_mb = os.path.getsize(fpath) / (1024 * 1024)
+            materials.append({
+                "filename": f,
+                "size": f"{size_mb:.1f} MB",
+                "type": ext.lstrip(".").upper(),
+            })
+    return materials
 
 
 _SOUL_CONTENT = _load_soul()
@@ -50,6 +88,10 @@ _SYSTEM_TEMPLATE = """{soul}
 - 回答长度适中：简单问题2-3句，复杂问题分点回答但不超过300字
 - 不要使用 markdown 格式符号（如 **、#），直接用自然语言
 - 在对话中自称"我"或"我们"，称用户为"您"
+
+### 可推荐的知识库材料
+以下是知识库中可供用户下载的材料列表，当用户询问相关内容时可以推荐：
+{materials_list}
 """
 
 _CONTEXT_TEMPLATE = """以下是从知识库中检索到的参考资料，请基于这些内容回答用户问题：
@@ -61,7 +103,7 @@ _CONTEXT_TEMPLATE = """以下是从知识库中检索到的参考资料，请基
 
 _NO_CONTEXT_TEMPLATE = """知识库中未检索到直接相关的内容。
 
-请根据你的基础认知（soul 中的公司信息）尽量回答，如果确实无法回答，请诚实告知用户并引导其联系人工客服（investor@liboinv.com）。
+请根据你的基础认知（soul 中的公司信息）尽量回答，如果确实无法回答，请诚实告知用户并引导其添加微信联系我们。
 
 ---
 用户问题：{query}"""
@@ -76,7 +118,44 @@ class RAGEngine:
             api_key=Config.OPENAI_API_KEY,
             base_url=Config.OPENAI_BASE_URL,
         )
-        self._system_prompt = _SYSTEM_TEMPLATE.format(soul=_SOUL_CONTENT)
+        self._build_system_prompt()
+
+    def _build_system_prompt(self):
+        """Build system prompt with current feedback rules and materials list."""
+        # Load feedback rules
+        rules = _load_feedback_rules()
+        feedback_section = ""
+        if rules:
+            rules_text = "\n".join(f"   - {r}" for r in rules)
+            feedback_section = f"""
+## 特别回复指令（基于用户反馈调整）
+
+以下是基于用户反馈总结的回复规则，请严格遵守：
+{rules_text}
+"""
+
+        # Build materials list
+        materials = get_available_materials()
+        if materials:
+            mat_lines = []
+            for m in materials:
+                mat_lines.append(f"- {m['filename']} ({m['type']}, {m['size']})")
+            materials_list = "\n".join(mat_lines)
+        else:
+            materials_list = "（暂无可分享的材料）"
+
+        # Inject feedback rules into soul content
+        soul_with_rules = _SOUL_CONTENT.replace("{feedback_rules}", feedback_section)
+
+        self._system_prompt = _SYSTEM_TEMPLATE.format(
+            soul=soul_with_rules,
+            materials_list=materials_list,
+        )
+
+    def reload_rules(self):
+        """Reload feedback rules and rebuild system prompt."""
+        self._build_system_prompt()
+        logger.info("System prompt rebuilt with updated feedback rules")
 
     def chat(
         self,
@@ -88,6 +167,9 @@ class RAGEngine:
 
         Flow: query rewrite -> retrieve -> generate
         """
+        # Rebuild system prompt to pick up any new feedback rules
+        self._build_system_prompt()
+
         # Step 1: Rewrite query for better retrieval (use conversation context)
         search_query = self._rewrite_query(query, history)
 
@@ -137,7 +219,7 @@ class RAGEngine:
             answer = resp.choices[0].message.content or "抱歉，我暂时无法回答这个问题。"
         except Exception as e:
             logger.error(f"LLM call failed: {e}")
-            answer = "抱歉，服务暂时出现问题，请稍后再试。如需帮助，请联系 investor@liboinv.com"
+            answer = "抱歉，服务暂时出现问题，请稍后再试。如需帮助，请添加我们的微信联系。[微信名片]"
 
         return answer
 

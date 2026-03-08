@@ -38,6 +38,11 @@ def parse_file(file_path: str) -> ParsedDocument:
 
         return parse_image(file_path)
 
+    if ext in Config.SUPPORTED_EXTENSIONS["txt"]:
+        from .txt_parser import parse_txt
+
+        return parse_txt(file_path)
+
     raise ValueError(
         f"Unsupported file type: {ext}. "
         f"Supported: {', '.join(sum(Config.SUPPORTED_EXTENSIONS.values(), []))}"
