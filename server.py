@@ -337,12 +337,20 @@ _CHAT_HTML = """\
   .wechat-card-placeholder .title { font-size: 14px; font-weight: 600; color: #2e7d32; margin-bottom: 4px; }
   .wechat-card-placeholder .hint { font-size: 12px; color: #888; }
 
-  /* Material card */
-  .material-card { background: linear-gradient(135deg, #eff6ff, #e0ecff); border: 1px solid #c4d5f0; border-radius: 12px; padding: 12px 16px; margin: 6px 0; display: flex; align-items: center; gap: 12px; animation: fadeIn .3s ease; cursor: pointer; transition: all .2s; }
+  /* Material card - file send style */
+  .material-card { background: linear-gradient(135deg, #eff6ff, #e0ecff); border: 1px solid #c4d5f0; border-radius: 12px; padding: 14px 16px; margin: 6px 0; display: flex; align-items: center; gap: 14px; animation: fadeIn .3s ease; cursor: pointer; transition: all .2s; }
   .material-card:hover { box-shadow: 0 2px 8px rgba(44,95,138,.15); border-color: #2c5f8a; }
-  .material-card .icon { font-size: 24px; }
-  .material-card .name { flex: 1; font-size: 13px; color: #333; font-weight: 500; }
-  .material-card .dl-btn { background: #2c5f8a; color: #fff; border: none; border-radius: 6px; padding: 5px 14px; font-size: 12px; cursor: pointer; transition: all .2s; }
+  .material-card .file-icon { width: 42px; height: 42px; border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; color: #fff; flex-shrink: 0; text-transform: uppercase; }
+  .material-card .file-icon.pdf { background: #e53935; }
+  .material-card .file-icon.doc { background: #1565c0; }
+  .material-card .file-icon.xls { background: #2e7d32; }
+  .material-card .file-icon.ppt { background: #e65100; }
+  .material-card .file-icon.txt { background: #757575; }
+  .material-card .file-icon.other { background: #546e7a; }
+  .material-card .file-info { flex: 1; min-width: 0; }
+  .material-card .file-name { font-size: 13px; color: #333; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .material-card .file-meta { font-size: 11px; color: #999; margin-top: 3px; }
+  .material-card .dl-btn { background: #2c5f8a; color: #fff; border: none; border-radius: 6px; padding: 6px 14px; font-size: 12px; cursor: pointer; transition: all .2s; flex-shrink: 0; }
   .material-card .dl-btn:hover { background: #1a3a5c; }
 
   .input-area { background: #fff; border-top: 1px solid #e4e8ee; padding: 14px 16px; }
@@ -471,6 +479,7 @@ let sessionId = null;
 let sending = false;
 let msgIndex = 0;
 let wechatConfig = { wechat_id: '', image_url: '' };
+let materialsMap = {}; // filename -> {size, type}
 
 // Load initial data
 fetch('/api/stats').then(r=>r.json()).then(d=>{
@@ -479,6 +488,12 @@ fetch('/api/stats').then(r=>r.json()).then(d=>{
 
 fetch('/api/wechat-card').then(r=>r.json()).then(d=>{
   wechatConfig = d;
+}).catch(()=>{});
+
+fetch('/api/materials').then(r=>r.json()).then(d=>{
+  (d.materials || []).forEach(m => {
+    materialsMap[m.filename] = { size: m.size, type: m.type };
+  });
 }).catch(()=>{});
 
 inputEl.addEventListener('input', () => {
@@ -565,12 +580,24 @@ function addMsg(role, text, typing = false) {
 
     let html = `<div class="avatar">${avatarText}</div><div class="msg-content"><div class="bubble">${escHtml(cleanText)}</div>`;
 
-    // Add material cards
+    // Add material cards (file send style)
     for (const mat of materials) {
+      const info = materialsMap[mat] || {};
+      const ext = mat.split('.').pop().toLowerCase();
+      const iconClass = ['pdf'].includes(ext) ? 'pdf'
+        : ['doc','docx'].includes(ext) ? 'doc'
+        : ['xls','xlsx','csv'].includes(ext) ? 'xls'
+        : ['ppt','pptx'].includes(ext) ? 'ppt'
+        : ['txt'].includes(ext) ? 'txt' : 'other';
+      const sizeTxt = info.size ? info.size : '';
+      const typeTxt = info.type ? info.type : ext.toUpperCase();
       html += `<div class="material-card" onclick="downloadMaterial('${escAttr(mat)}')">
-        <span class="icon">📄</span>
-        <span class="name">${escHtml(mat)}</span>
-        <button class="dl-btn">下载</button>
+        <div class="file-icon ${iconClass}">${typeTxt}</div>
+        <div class="file-info">
+          <div class="file-name">${escHtml(mat)}</div>
+          <div class="file-meta">${sizeTxt ? typeTxt + ' 文件 · ' + sizeTxt : typeTxt + ' 文件'}</div>
+        </div>
+        <button class="dl-btn">接收文件</button>
       </div>`;
     }
 
@@ -652,7 +679,12 @@ function renderWechatCard() {
 }
 
 function downloadMaterial(filename) {
-  window.open('/api/materials/' + encodeURIComponent(filename), '_blank');
+  const a = document.createElement('a');
+  a.href = '/api/materials/' + encodeURIComponent(filename);
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
 }
 
 function feedback(btn, idx, rating) {
