@@ -23,6 +23,21 @@ class Config:
     # Tesseract
     TESSERACT_CMD: str = os.getenv("TESSERACT_CMD", "tesseract")
 
+    # DeepSeek API (OpenAI-compatible)
+    DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
+    DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
+    DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+
+    # Feishu Webhook
+    FEISHU_WEBHOOK_URL: str = os.getenv("FEISHU_WEBHOOK_URL", "")
+
+    # Admin
+    ADMIN_BASE_URL: str = os.getenv("ADMIN_BASE_URL", "http://localhost:8000")
+    ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
+
+    # Webhook secret (optional, for verifying robot requests)
+    WEBHOOK_SECRET: str = os.getenv("WEBHOOK_SECRET", "")
+
     # Supported file extensions
     SUPPORTED_EXTENSIONS: dict = {
         "pdf": [".pdf"],

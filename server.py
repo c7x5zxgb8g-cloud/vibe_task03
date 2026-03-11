@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import os
+import secrets
 import uuid
 import shutil
 from contextlib import asynccontextmanager
 from datetime import datetime
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -62,7 +66,21 @@ async def lifespan(app: FastAPI):
     _rag_engine = RAGEngine(store=store)
     stats = store.get_stats()
     logger.info(f"Server started. Knowledge base: {stats['total_documents']} documents")
+
+    # Initialize leads database
+    from database import init_db
+    init_db()
+
+    # Start background message processor
+    from background_tasks import start_message_processor, stop_message_processor
+    processor_task = asyncio.create_task(start_message_processor())
+
     yield
+
+    # Stop background processor
+    stop_message_processor()
+    processor_task.cancel()
+
     _rag_engine = None
     _sessions.clear()
 
@@ -105,6 +123,38 @@ class FeedbackRequest(BaseModel):
 class FeedbackRuleRequest(BaseModel):
     rule: str
     active: bool = True
+
+
+# ── Webhook & Admin models ─────────────────────────────────────
+
+class WebhookMessageRequest(BaseModel):
+    sender_id: str
+    sender_name: str = ""
+    group_id: str = ""
+    group_name: str = ""
+    content: str
+    msg_type: str = "text"
+    msg_id: str | None = None
+    timestamp: str | None = None
+
+
+class WebhookMessageSentRequest(BaseModel):
+    follow_up_id: int
+    success: bool = True
+    error: str = ""
+
+
+class AdminLoginRequest(BaseModel):
+    password: str
+
+
+class FollowUpConfirmRequest(BaseModel):
+    admin_note: str = ""
+
+
+class FollowUpSendRequest(BaseModel):
+    follow_up_id: int
+    message: str = ""
 
 
 # ── API Endpoints ────────────────────────────────────────────────
@@ -262,6 +312,299 @@ async def delete_feedback_rule(index: int):
     raise HTTPException(status_code=404, detail="规则不存在")
 
 
+# ── Webhook API (for WeChat robot) ──────────────────────────────
+
+@app.post("/api/webhook/message")
+async def webhook_receive_message(req: WebhookMessageRequest):
+    """Receive a group chat message from the WeChat robot."""
+    from database import upsert_customer, insert_message
+
+    # Optional: verify webhook secret
+    # (robot can pass secret as query param or header if configured)
+
+    customer_id = upsert_customer(
+        wechat_user_id=req.sender_id,
+        name=req.sender_name or req.sender_id,
+        group_chat_id=req.group_id,
+        group_chat_name=req.group_name,
+    )
+
+    msg_id = insert_message(
+        customer_id=customer_id,
+        content=req.content,
+        msg_type=req.msg_type,
+        group_chat_id=req.group_id,
+        msg_id=req.msg_id,
+        received_at=req.timestamp,
+    )
+
+    if msg_id is None:
+        return {"status": "duplicate", "message": "消息已存在"}
+
+    return {"status": "ok", "message_id": msg_id, "customer_id": customer_id}
+
+
+@app.get("/api/webhook/pending-messages")
+async def webhook_get_pending_messages():
+    """Get follow-up messages ready to be sent by the robot."""
+    from database import get_pending_follow_ups
+
+    pending = get_pending_follow_ups()
+    messages = [
+        {
+            "follow_up_id": f["id"],
+            "target_user_id": f["wechat_user_id"],
+            "target_group_id": f.get("target_group_id", ""),
+            "content": f["generated_message"],
+            "customer_name": f["customer_name"],
+        }
+        for f in pending
+    ]
+    return {"messages": messages}
+
+
+@app.post("/api/webhook/message-sent")
+async def webhook_message_sent(req: WebhookMessageSentRequest):
+    """Callback from robot confirming a follow-up message was sent."""
+    from database import update_follow_up
+
+    if req.success:
+        update_follow_up(
+            req.follow_up_id,
+            status="sent",
+            sent_at=datetime.now().isoformat(),
+        )
+    else:
+        update_follow_up(
+            req.follow_up_id,
+            status="failed",
+            error_message=req.error,
+        )
+    return {"status": "ok"}
+
+
+# ── Admin API ──────────────────────────────────────────────────
+
+# Simple token-based auth
+_admin_tokens: set[str] = set()
+
+
+def _check_admin(authorization: str | None) -> bool:
+    if not authorization:
+        return False
+    token = authorization.replace("Bearer ", "")
+    return token in _admin_tokens
+
+
+@app.post("/api/admin/login")
+async def admin_login(req: AdminLoginRequest):
+    """Admin login with simple password."""
+    if req.password != Config.ADMIN_PASSWORD:
+        raise HTTPException(status_code=401, detail="密码错误")
+    token = secrets.token_hex(16)
+    _admin_tokens.add(token)
+    return {"status": "ok", "token": token}
+
+
+@app.get("/api/admin/dashboard")
+async def admin_dashboard(authorization: str | None = Header(None)):
+    """Get dashboard statistics."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_dashboard_stats
+    return get_dashboard_stats()
+
+
+@app.get("/api/admin/leads")
+async def admin_list_leads(
+    intent_level: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    authorization: str | None = Header(None),
+):
+    """List leads with intent analysis results."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_high_intent_leads
+    leads = get_high_intent_leads(intent_level=intent_level, limit=limit, offset=offset)
+    return {"leads": leads}
+
+
+@app.get("/api/admin/leads/{customer_id}")
+async def admin_lead_detail(customer_id: int, authorization: str | None = Header(None)):
+    """Get detailed info for a specific lead."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_customer, get_messages_by_customer, get_follow_ups
+    import sqlite3
+
+    customer = get_customer(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="客户不存在")
+
+    messages = get_messages_by_customer(customer_id, limit=100)
+
+    # Get intent analyses for this customer
+    from database import get_connection
+    conn = get_connection()
+    try:
+        analyses = [dict(r) for r in conn.execute(
+            "SELECT * FROM intent_analyses WHERE customer_id=? ORDER BY analyzed_at DESC",
+            (customer_id,)
+        ).fetchall()]
+    finally:
+        conn.close()
+
+    follow_ups = get_follow_ups()
+    customer_followups = [f for f in follow_ups if f["customer_id"] == customer_id]
+
+    return {
+        "customer": customer,
+        "messages": messages,
+        "analyses": analyses,
+        "follow_ups": customer_followups,
+    }
+
+
+@app.get("/api/admin/messages")
+async def admin_list_messages(
+    customer_id: int | None = None,
+    group_chat_id: str | None = None,
+    limit: int = 100,
+    offset: int = 0,
+    authorization: str | None = Header(None),
+):
+    """List all messages with optional filters."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import list_messages
+    msgs = list_messages(customer_id=customer_id, group_chat_id=group_chat_id,
+                         limit=limit, offset=offset)
+    return {"messages": msgs}
+
+
+@app.post("/api/admin/follow-up/{customer_id}/confirm")
+async def admin_confirm_follow_up(
+    customer_id: int,
+    req: FollowUpConfirmRequest,
+    authorization: str | None = Header(None),
+):
+    """Confirm follow-up: create record and generate AI message."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+
+    from database import (
+        get_customer, get_messages_by_customer, create_follow_up,
+        update_follow_up, get_connection
+    )
+    from followup_generator import generate_followup_message
+
+    customer = get_customer(customer_id)
+    if not customer:
+        raise HTTPException(status_code=404, detail="客户不存在")
+
+    # Get latest intent analysis
+    conn = get_connection()
+    try:
+        latest_analysis = conn.execute(
+            "SELECT * FROM intent_analyses WHERE customer_id=? ORDER BY analyzed_at DESC LIMIT 1",
+            (customer_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+
+    intent_summary = dict(latest_analysis)["intent_summary"] if latest_analysis else ""
+    analysis_id = dict(latest_analysis)["id"] if latest_analysis else None
+
+    # Get recent messages for context
+    messages = get_messages_by_customer(customer_id, limit=10)
+    latest_content = messages[0]["content"] if messages else ""
+
+    # Create follow-up record
+    follow_up_id = create_follow_up(
+        customer_id=customer_id,
+        intent_analysis_id=analysis_id,
+        target_user_id=customer["wechat_user_id"],
+        target_group_id=customer.get("group_chat_id", ""),
+    )
+
+    update_follow_up(
+        follow_up_id,
+        status="confirmed",
+        admin_note=req.admin_note,
+        confirmed_at=datetime.now().isoformat(),
+    )
+
+    # Generate follow-up message via DeepSeek
+    generated = await asyncio.to_thread(
+        generate_followup_message,
+        customer_name=customer["name"],
+        message_content=latest_content,
+        intent_summary=intent_summary,
+        recent_messages=messages,
+        admin_note=req.admin_note,
+    )
+
+    if generated:
+        update_follow_up(
+            follow_up_id,
+            status="message_generated",
+            generated_message=generated,
+        )
+    else:
+        update_follow_up(follow_up_id, status="failed", error_message="消息生成失败")
+
+    return {
+        "status": "ok",
+        "follow_up_id": follow_up_id,
+        "generated_message": generated,
+    }
+
+
+@app.post("/api/admin/follow-up/send")
+async def admin_send_follow_up(
+    req: FollowUpSendRequest,
+    authorization: str | None = Header(None),
+):
+    """Approve and queue the follow-up message for sending."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+
+    from database import get_follow_up, update_follow_up
+
+    follow_up = get_follow_up(req.follow_up_id)
+    if not follow_up:
+        raise HTTPException(status_code=404, detail="跟进记录不存在")
+
+    # Update message if admin edited it
+    message = req.message or follow_up["generated_message"]
+    if not message:
+        raise HTTPException(status_code=400, detail="消息内容不能为空")
+
+    update_follow_up(
+        req.follow_up_id,
+        status="message_generated",
+        generated_message=message,
+    )
+
+    return {"status": "ok", "message": "消息已加入发送队列，等待机器人拉取"}
+
+
+@app.get("/api/admin/follow-ups")
+async def admin_list_follow_ups(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    authorization: str | None = Header(None),
+):
+    """List follow-up records."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_follow_ups
+    follow_ups = get_follow_ups(status=status, limit=limit, offset=offset)
+    return {"follow_ups": follow_ups}
+
+
 # ── Serve static files ───────────────────────────────────────────
 
 # Mount static directory for WeChat card images
@@ -275,6 +618,11 @@ app.mount("/static", StaticFiles(directory=os.path.join(_BASE_DIR, "static")), n
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return _CHAT_HTML
+
+
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page():
+    return _ADMIN_HTML
 
 
 _CHAT_HTML = """\
@@ -806,6 +1154,528 @@ function escHtml(s) {
 
 function escAttr(s) {
   return s.replace(/'/g, "\\\\'").replace(/"/g, '&quot;');
+}
+</script>
+</body>
+</html>
+"""
+
+
+_ADMIN_HTML = """\
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>理博基金 - 线索管理后台</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif; background: #f5f6fa; min-height: 100vh; }
+
+  .header { background: linear-gradient(135deg, #1a3a5c, #2c5f8a); color: #fff; padding: 14px 24px; display: flex; align-items: center; gap: 14px; box-shadow: 0 2px 12px rgba(0,0,0,.12); }
+  .header .logo { font-size: 20px; font-weight: 700; letter-spacing: 2px; }
+  .header .logo span { font-size: 12px; font-weight: 400; opacity: .7; letter-spacing: 1px; margin-left: 8px; }
+  .header .actions { margin-left: auto; display: flex; gap: 12px; align-items: center; }
+  .header a { color: #fff; text-decoration: none; opacity: .8; font-size: 13px; }
+  .header a:hover { opacity: 1; }
+
+  /* Login */
+  .login-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.4); display: flex; align-items: center; justify-content: center; z-index: 2000; }
+  .login-box { background: #fff; border-radius: 16px; padding: 32px; width: 340px; box-shadow: 0 20px 60px rgba(0,0,0,.2); text-align: center; }
+  .login-box h3 { font-size: 18px; color: #1a3a5c; margin-bottom: 20px; }
+  .login-box input { width: 100%; border: 1.5px solid #dde3ea; border-radius: 10px; padding: 10px 14px; font-size: 14px; outline: none; margin-bottom: 14px; }
+  .login-box input:focus { border-color: #2c5f8a; }
+  .login-box button { width: 100%; background: #2c5f8a; color: #fff; border: none; border-radius: 10px; padding: 10px; font-size: 14px; cursor: pointer; }
+  .login-box button:hover { background: #1a3a5c; }
+  .login-box .error { color: #e53935; font-size: 12px; margin-top: 8px; }
+
+  /* Tabs */
+  .tabs { display: flex; background: #fff; border-bottom: 1px solid #e4e8ee; padding: 0 24px; }
+  .tab { padding: 12px 20px; font-size: 14px; color: #666; cursor: pointer; border-bottom: 2px solid transparent; transition: all .2s; }
+  .tab:hover { color: #2c5f8a; }
+  .tab.active { color: #2c5f8a; border-bottom-color: #2c5f8a; font-weight: 600; }
+
+  .content { max-width: 1200px; margin: 0 auto; padding: 20px; }
+
+  .panel { display: none; }
+  .panel.active { display: block; }
+
+  /* Dashboard cards */
+  .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .stat-card { background: #fff; border-radius: 12px; padding: 20px; box-shadow: 0 1px 6px rgba(0,0,0,.06); }
+  .stat-card .label { font-size: 13px; color: #888; margin-bottom: 6px; }
+  .stat-card .value { font-size: 28px; font-weight: 700; color: #1a3a5c; }
+
+  /* Tables */
+  .card { background: #fff; border-radius: 12px; box-shadow: 0 1px 6px rgba(0,0,0,.06); overflow: hidden; margin-bottom: 20px; }
+  .card-header { padding: 16px 20px; border-bottom: 1px solid #f0f0f0; display: flex; align-items: center; gap: 12px; }
+  .card-header h3 { font-size: 16px; color: #333; }
+  .filter-btns { display: flex; gap: 6px; margin-left: auto; }
+  .filter-btn { padding: 4px 12px; border-radius: 14px; border: 1px solid #dde3ea; background: #fff; font-size: 12px; cursor: pointer; color: #666; transition: all .2s; }
+  .filter-btn:hover, .filter-btn.active { background: #2c5f8a; color: #fff; border-color: #2c5f8a; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th { background: #f8f9fb; text-align: left; padding: 10px 16px; font-size: 12px; color: #888; font-weight: 600; }
+  td { padding: 12px 16px; font-size: 13px; color: #333; border-top: 1px solid #f0f0f0; }
+  tr:hover td { background: #fafbfc; }
+
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge.high { background: #fce4ec; color: #c62828; }
+  .badge.medium { background: #fff3e0; color: #e65100; }
+  .badge.low { background: #e8f5e9; color: #2e7d32; }
+  .badge.none { background: #f5f5f5; color: #999; }
+  .badge.pending { background: #fff3e0; color: #e65100; }
+  .badge.confirmed { background: #e3f2fd; color: #1565c0; }
+  .badge.message_generated { background: #e8f5e9; color: #2e7d32; }
+  .badge.sent { background: #e8f5e9; color: #1b5e20; }
+  .badge.failed { background: #fce4ec; color: #c62828; }
+
+  .btn { padding: 5px 14px; border-radius: 6px; font-size: 12px; cursor: pointer; transition: all .2s; border: none; }
+  .btn-primary { background: #2c5f8a; color: #fff; }
+  .btn-primary:hover { background: #1a3a5c; }
+  .btn-success { background: #2e7d32; color: #fff; }
+  .btn-success:hover { background: #1b5e20; }
+  .btn-sm { padding: 3px 10px; font-size: 11px; }
+
+  .text-truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .text-muted { color: #999; font-size: 12px; }
+
+  .empty { text-align: center; padding: 40px; color: #999; font-size: 14px; }
+
+  /* Modal */
+  .modal-overlay { display: none; position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,.4); z-index: 1000; }
+  .modal-overlay.show { display: flex; align-items: center; justify-content: center; }
+  .modal { background: #fff; border-radius: 16px; padding: 28px; max-width: 600px; width: 90%; max-height: 80vh; overflow-y: auto; box-shadow: 0 20px 60px rgba(0,0,0,.2); }
+  .modal h3 { font-size: 18px; color: #1a3a5c; margin-bottom: 16px; }
+  .modal textarea { width: 100%; border: 1.5px solid #dde3ea; border-radius: 10px; padding: 12px; font-size: 13px; resize: vertical; min-height: 100px; outline: none; font-family: inherit; margin: 10px 0; }
+  .modal textarea:focus { border-color: #2c5f8a; }
+  .modal-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 16px; }
+  .modal label { font-size: 13px; color: #666; display: block; margin-bottom: 4px; }
+
+  /* Detail panel */
+  .detail-section { margin-bottom: 20px; }
+  .detail-section h4 { font-size: 14px; color: #555; margin-bottom: 10px; font-weight: 600; }
+  .msg-list { max-height: 300px; overflow-y: auto; }
+  .msg-item { padding: 8px 12px; border-left: 3px solid #dde3ea; margin-bottom: 6px; background: #fafbfc; border-radius: 0 8px 8px 0; }
+  .msg-item .msg-meta { font-size: 11px; color: #999; margin-bottom: 2px; }
+  .msg-item .msg-text { font-size: 13px; color: #333; line-height: 1.6; }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">理博基金<span>线索管理后台</span></div>
+  <div class="actions">
+    <a href="/">返回客服</a>
+  </div>
+</div>
+
+<!-- Login overlay -->
+<div class="login-overlay" id="loginOverlay">
+  <div class="login-box">
+    <h3>管理员登录</h3>
+    <input type="password" id="loginPwd" placeholder="请输入管理密码" onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()">登录</button>
+    <div class="error" id="loginError"></div>
+  </div>
+</div>
+
+<!-- Tabs -->
+<div class="tabs">
+  <div class="tab active" onclick="switchTab('dashboard')">仪表盘</div>
+  <div class="tab" onclick="switchTab('leads')">客户线索</div>
+  <div class="tab" onclick="switchTab('followups')">跟进管理</div>
+  <div class="tab" onclick="switchTab('messages')">消息记录</div>
+</div>
+
+<div class="content">
+
+  <!-- Dashboard -->
+  <div class="panel active" id="panel-dashboard">
+    <div class="stats-grid" id="statsGrid"></div>
+  </div>
+
+  <!-- Leads -->
+  <div class="panel" id="panel-leads">
+    <div class="card">
+      <div class="card-header">
+        <h3>客户线索</h3>
+        <div class="filter-btns">
+          <button class="filter-btn active" onclick="filterLeads(null, this)">全部</button>
+          <button class="filter-btn" onclick="filterLeads('high', this)">高意向</button>
+          <button class="filter-btn" onclick="filterLeads('medium', this)">中意向</button>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>客户</th><th>来源群</th><th>最新消息</th><th>意向</th><th>分数</th><th>时间</th><th>操作</th></tr></thead>
+        <tbody id="leadsBody"></tbody>
+      </table>
+      <div class="empty" id="leadsEmpty" style="display:none;">暂无线索数据</div>
+    </div>
+  </div>
+
+  <!-- Follow-ups -->
+  <div class="panel" id="panel-followups">
+    <div class="card">
+      <div class="card-header">
+        <h3>跟进管理</h3>
+        <div class="filter-btns">
+          <button class="filter-btn active" onclick="filterFollowUps(null, this)">全部</button>
+          <button class="filter-btn" onclick="filterFollowUps('message_generated', this)">待发送</button>
+          <button class="filter-btn" onclick="filterFollowUps('sent', this)">已发送</button>
+          <button class="filter-btn" onclick="filterFollowUps('failed', this)">失败</button>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>客户</th><th>状态</th><th>跟进消息</th><th>更新时间</th><th>操作</th></tr></thead>
+        <tbody id="followupsBody"></tbody>
+      </table>
+      <div class="empty" id="followupsEmpty" style="display:none;">暂无跟进记录</div>
+    </div>
+  </div>
+
+  <!-- Messages -->
+  <div class="panel" id="panel-messages">
+    <div class="card">
+      <div class="card-header">
+        <h3>消息记录</h3>
+      </div>
+      <table>
+        <thead><tr><th>客户</th><th>群</th><th>内容</th><th>时间</th></tr></thead>
+        <tbody id="messagesBody"></tbody>
+      </table>
+      <div class="empty" id="messagesEmpty" style="display:none;">暂无消息记录</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Confirm follow-up modal -->
+<div class="modal-overlay" id="confirmModal">
+  <div class="modal">
+    <h3>确认跟进客户</h3>
+    <div id="confirmCustomerInfo"></div>
+    <label>管理员备注（可选）</label>
+    <textarea id="confirmNote" placeholder="输入备注信息，AI会参考此内容生成跟进消息..."></textarea>
+    <div class="modal-actions">
+      <button class="btn" style="background:#f5f5f5;color:#666;border:1px solid #ddd;" onclick="closeModal('confirmModal')">取消</button>
+      <button class="btn btn-primary" id="confirmBtn" onclick="doConfirmFollowUp()">确认并生成消息</button>
+    </div>
+  </div>
+</div>
+
+<!-- Edit & Send modal -->
+<div class="modal-overlay" id="sendModal">
+  <div class="modal">
+    <h3>编辑并发送跟进消息</h3>
+    <div id="sendCustomerInfo"></div>
+    <label>跟进消息内容</label>
+    <textarea id="sendMessage"></textarea>
+    <div class="modal-actions">
+      <button class="btn" style="background:#f5f5f5;color:#666;border:1px solid #ddd;" onclick="closeModal('sendModal')">取消</button>
+      <button class="btn btn-success" id="sendBtn" onclick="doSendFollowUp()">确认发送</button>
+    </div>
+  </div>
+</div>
+
+<!-- Lead detail modal -->
+<div class="modal-overlay" id="detailModal">
+  <div class="modal" style="max-width:700px;">
+    <h3 id="detailTitle">客户详情</h3>
+    <div id="detailContent"></div>
+    <div class="modal-actions">
+      <button class="btn" style="background:#f5f5f5;color:#666;border:1px solid #ddd;" onclick="closeModal('detailModal')">关闭</button>
+    </div>
+  </div>
+</div>
+
+<script>
+let token = localStorage.getItem('admin_token') || '';
+let currentLeadFilter = null;
+let currentFUFilter = null;
+let pendingCustomerId = null;
+let pendingFollowUpId = null;
+
+// Check auth
+if (token) {
+  document.getElementById('loginOverlay').style.display = 'none';
+  loadDashboard();
+} else {
+  document.getElementById('loginOverlay').style.display = 'flex';
+}
+
+async function doLogin() {
+  const pwd = document.getElementById('loginPwd').value;
+  try {
+    const res = await apiFetch('/api/admin/login', 'POST', { password: pwd });
+    if (res.token) {
+      token = res.token;
+      localStorage.setItem('admin_token', token);
+      document.getElementById('loginOverlay').style.display = 'none';
+      loadDashboard();
+    }
+  } catch(e) {
+    document.getElementById('loginError').textContent = '密码错误';
+  }
+}
+
+async function apiFetch(url, method = 'GET', body = null) {
+  const opts = { method, headers: { 'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json' } };
+  if (body) opts.body = JSON.stringify(body);
+  const res = await fetch(url, opts);
+  if (res.status === 401) {
+    localStorage.removeItem('admin_token');
+    token = '';
+    document.getElementById('loginOverlay').style.display = 'flex';
+    throw new Error('Unauthorized');
+  }
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+function switchTab(name) {
+  document.querySelectorAll('.tab').forEach((t, i) => {
+    t.classList.toggle('active', t.textContent.includes(
+      name === 'dashboard' ? '仪表盘' : name === 'leads' ? '客户线索' : name === 'followups' ? '跟进管理' : '消息记录'
+    ));
+  });
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.getElementById('panel-' + name).classList.add('active');
+
+  if (name === 'dashboard') loadDashboard();
+  else if (name === 'leads') loadLeads();
+  else if (name === 'followups') loadFollowUps();
+  else if (name === 'messages') loadMessages();
+}
+
+// Dashboard
+async function loadDashboard() {
+  try {
+    const d = await apiFetch('/api/admin/dashboard');
+    document.getElementById('statsGrid').innerHTML = `
+      <div class="stat-card"><div class="label">今日消息</div><div class="value">${d.today_messages}</div></div>
+      <div class="stat-card"><div class="label">高意向线索</div><div class="value">${d.high_intent_leads}</div></div>
+      <div class="stat-card"><div class="label">待跟进</div><div class="value">${d.pending_follow_ups}</div></div>
+      <div class="stat-card"><div class="label">已发送</div><div class="value">${d.sent_follow_ups}</div></div>
+      <div class="stat-card"><div class="label">客户总数</div><div class="value">${d.total_customers}</div></div>
+      <div class="stat-card"><div class="label">消息总数</div><div class="value">${d.total_messages}</div></div>
+    `;
+  } catch(e) {}
+}
+
+// Leads
+async function loadLeads(level = null) {
+  try {
+    let url = '/api/admin/leads?limit=100';
+    if (level) url += '&intent_level=' + level;
+    const d = await apiFetch(url);
+    const body = document.getElementById('leadsBody');
+    const empty = document.getElementById('leadsEmpty');
+    if (!d.leads || d.leads.length === 0) {
+      body.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    body.innerHTML = d.leads.map(l => `<tr>
+      <td><strong>${esc(l.customer_name)}</strong><br><span class="text-muted">${esc(l.wechat_user_id)}</span></td>
+      <td>${esc(l.group_chat_name || '-')}</td>
+      <td><div class="text-truncate">${esc(l.message_content || '')}</div></td>
+      <td><span class="badge ${l.intent_level}">${levelLabel(l.intent_level)}</span></td>
+      <td>${(l.intent_score * 100).toFixed(0)}%</td>
+      <td class="text-muted">${formatTime(l.analyzed_at)}</td>
+      <td>
+        <button class="btn btn-primary btn-sm" onclick="showDetail(${l.customer_id})">详情</button>
+        <button class="btn btn-success btn-sm" onclick="openConfirm(${l.customer_id}, '${esc(l.customer_name)}')">跟进</button>
+      </td>
+    </tr>`).join('');
+  } catch(e) {}
+}
+
+function filterLeads(level, btn) {
+  currentLeadFilter = level;
+  document.querySelectorAll('#panel-leads .filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadLeads(level);
+}
+
+// Follow-ups
+async function loadFollowUps(status = null) {
+  try {
+    let url = '/api/admin/follow-ups?limit=100';
+    if (status) url += '&status=' + status;
+    const d = await apiFetch(url);
+    const body = document.getElementById('followupsBody');
+    const empty = document.getElementById('followupsEmpty');
+    if (!d.follow_ups || d.follow_ups.length === 0) {
+      body.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    d.follow_ups.forEach(f => { _followUpCache[f.id] = f; });
+    body.innerHTML = d.follow_ups.map(f => `<tr>
+      <td><strong>${esc(f.customer_name)}</strong></td>
+      <td><span class="badge ${f.status}">${statusLabel(f.status)}</span></td>
+      <td><div class="text-truncate">${esc(f.generated_message || '-')}</div></td>
+      <td class="text-muted">${formatTime(f.updated_at)}</td>
+      <td>${renderFollowUpAction(f)}</td>
+    </tr>`).join('');
+  } catch(e) {}
+}
+
+function filterFollowUps(status, btn) {
+  currentFUFilter = status;
+  document.querySelectorAll('#panel-followups .filter-btn').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+  loadFollowUps(status);
+}
+
+// Messages
+async function loadMessages() {
+  try {
+    const d = await apiFetch('/api/admin/messages?limit=200');
+    const body = document.getElementById('messagesBody');
+    const empty = document.getElementById('messagesEmpty');
+    if (!d.messages || d.messages.length === 0) {
+      body.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    body.innerHTML = d.messages.map(m => `<tr>
+      <td><strong>${esc(m.customer_name || '')}</strong></td>
+      <td class="text-muted">${esc(m.group_chat_id || '-')}</td>
+      <td><div class="text-truncate">${esc(m.content)}</div></td>
+      <td class="text-muted">${formatTime(m.received_at)}</td>
+    </tr>`).join('');
+  } catch(e) {}
+}
+
+// Detail
+async function showDetail(customerId) {
+  try {
+    const d = await apiFetch('/api/admin/leads/' + customerId);
+    document.getElementById('detailTitle').textContent = '客户详情 - ' + (d.customer.name || d.customer.wechat_user_id);
+    let html = '';
+
+    html += '<div class="detail-section"><h4>基本信息</h4>';
+    html += `<p>微信ID: ${esc(d.customer.wechat_user_id)} | 群: ${esc(d.customer.group_chat_name || '-')} | 首次出现: ${formatTime(d.customer.first_seen_at)}</p></div>`;
+
+    if (d.analyses && d.analyses.length > 0) {
+      html += '<div class="detail-section"><h4>意向分析</h4>';
+      d.analyses.forEach(a => {
+        html += `<div class="msg-item"><div class="msg-meta"><span class="badge ${a.intent_level}">${levelLabel(a.intent_level)}</span> ${(a.intent_score*100).toFixed(0)}% - ${formatTime(a.analyzed_at)}</div><div class="msg-text">${esc(a.intent_summary)}</div></div>`;
+      });
+      html += '</div>';
+    }
+
+    if (d.messages && d.messages.length > 0) {
+      html += '<div class="detail-section"><h4>消息记录</h4><div class="msg-list">';
+      d.messages.forEach(m => {
+        html += `<div class="msg-item"><div class="msg-meta">${formatTime(m.received_at)}</div><div class="msg-text">${esc(m.content)}</div></div>`;
+      });
+      html += '</div></div>';
+    }
+
+    document.getElementById('detailContent').innerHTML = html;
+    document.getElementById('detailModal').classList.add('show');
+  } catch(e) {}
+}
+
+// Confirm follow-up
+function openConfirm(customerId, name) {
+  pendingCustomerId = customerId;
+  document.getElementById('confirmCustomerInfo').innerHTML = `<p>客户: <strong>${esc(name)}</strong></p>`;
+  document.getElementById('confirmNote').value = '';
+  document.getElementById('confirmModal').classList.add('show');
+}
+
+async function doConfirmFollowUp() {
+  const note = document.getElementById('confirmNote').value;
+  const btn = document.getElementById('confirmBtn');
+  btn.disabled = true;
+  btn.textContent = '生成中...';
+  try {
+    const d = await apiFetch('/api/admin/follow-up/' + pendingCustomerId + '/confirm', 'POST', { admin_note: note });
+    closeModal('confirmModal');
+    if (d.generated_message) {
+      pendingFollowUpId = d.follow_up_id;
+      document.getElementById('sendCustomerInfo').innerHTML = '<p>AI已生成跟进消息，您可以编辑后发送：</p>';
+      document.getElementById('sendMessage').value = d.generated_message;
+      document.getElementById('sendModal').classList.add('show');
+    } else {
+      alert('消息生成失败，请重试');
+    }
+  } catch(e) {
+    alert('操作失败: ' + e.message);
+  }
+  btn.disabled = false;
+  btn.textContent = '确认并生成消息';
+}
+
+// Send follow-up
+function openSend(followUpId, name, message) {
+  pendingFollowUpId = followUpId;
+  document.getElementById('sendCustomerInfo').innerHTML = `<p>客户: <strong>${esc(name)}</strong></p>`;
+  document.getElementById('sendMessage').value = message;
+  document.getElementById('sendModal').classList.add('show');
+}
+
+async function doSendFollowUp() {
+  const msg = document.getElementById('sendMessage').value.trim();
+  if (!msg) { alert('消息不能为空'); return; }
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  try {
+    await apiFetch('/api/admin/follow-up/send', 'POST', { follow_up_id: pendingFollowUpId, message: msg });
+    closeModal('sendModal');
+    alert('消息已加入发送队列');
+    loadFollowUps(currentFUFilter);
+  } catch(e) {
+    alert('操作失败: ' + e.message);
+  }
+  btn.disabled = false;
+}
+
+function renderFollowUpAction(f) {
+  if (f.status === 'message_generated') {
+    return '<button class="btn btn-success btn-sm" onclick="openSendById(' + f.id + ')">编辑发送</button>';
+  } else if (f.status === 'failed') {
+    return '<span class="text-muted">' + esc(f.error_message || '发送失败') + '</span>';
+  }
+  return '';
+}
+
+let _followUpCache = {};
+function openSendById(followUpId) {
+  const f = _followUpCache[followUpId];
+  if (f) openSend(f.id, f.customer_name, f.generated_message);
+}
+
+function closeModal(id) {
+  document.getElementById(id).classList.remove('show');
+}
+
+// Helpers
+function esc(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+function escJs(s) {
+  if (!s) return '';
+  return String(s).replace(/\\\\/g,'\\\\\\\\').replace(/`/g,'\\\\`').replace(/\\$/g,'\\\\$');
+}
+function levelLabel(l) {
+  return { high: '高意向', medium: '中意向', low: '低意向', none: '无意向' }[l] || l;
+}
+function statusLabel(s) {
+  return { pending: '待处理', confirmed: '已确认', message_generated: '待发送', sent: '已发送', failed: '失败' }[s] || s;
+}
+function formatTime(t) {
+  if (!t) return '-';
+  try { return new Date(t).toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }); }
+  catch(e) { return t; }
 }
 </script>
 </body>

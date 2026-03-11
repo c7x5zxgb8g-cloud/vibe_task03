@@ -1,0 +1,390 @@
+"""SQLite database layer for leads tracking system."""
+
+import os
+import sqlite3
+import json
+from datetime import datetime
+
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+_BASE_DIR = os.path.dirname(__file__)
+_DB_PATH = os.path.join(_BASE_DIR, "leads.db")
+
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS customers (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    wechat_user_id  TEXT NOT NULL UNIQUE,
+    name            TEXT NOT NULL DEFAULT '',
+    group_chat_id   TEXT NOT NULL DEFAULT '',
+    group_chat_name TEXT NOT NULL DEFAULT '',
+    first_seen_at   TEXT NOT NULL,
+    last_seen_at    TEXT NOT NULL,
+    note            TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_customers_wechat_user_id ON customers(wechat_user_id);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    msg_id          TEXT UNIQUE,
+    customer_id     INTEGER NOT NULL REFERENCES customers(id),
+    content         TEXT NOT NULL,
+    msg_type        TEXT NOT NULL DEFAULT 'text',
+    group_chat_id   TEXT NOT NULL DEFAULT '',
+    received_at     TEXT NOT NULL,
+    processed       INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_messages_customer_id ON messages(customer_id);
+CREATE INDEX IF NOT EXISTS idx_messages_processed ON messages(processed);
+CREATE INDEX IF NOT EXISTS idx_messages_received_at ON messages(received_at);
+
+CREATE TABLE IF NOT EXISTS intent_analyses (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    message_id      INTEGER NOT NULL REFERENCES messages(id),
+    customer_id     INTEGER NOT NULL REFERENCES customers(id),
+    intent_level    TEXT NOT NULL,
+    intent_score    REAL NOT NULL DEFAULT 0,
+    intent_summary  TEXT NOT NULL DEFAULT '',
+    keywords        TEXT NOT NULL DEFAULT '[]',
+    raw_response    TEXT NOT NULL DEFAULT '',
+    analyzed_at     TEXT NOT NULL,
+    notified        INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_intent_customer ON intent_analyses(customer_id);
+CREATE INDEX IF NOT EXISTS idx_intent_level ON intent_analyses(intent_level);
+
+CREATE TABLE IF NOT EXISTS follow_ups (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer_id         INTEGER NOT NULL REFERENCES customers(id),
+    intent_analysis_id  INTEGER REFERENCES intent_analyses(id),
+    status              TEXT NOT NULL DEFAULT 'pending',
+    generated_message   TEXT NOT NULL DEFAULT '',
+    admin_note          TEXT NOT NULL DEFAULT '',
+    target_user_id      TEXT NOT NULL DEFAULT '',
+    target_group_id     TEXT NOT NULL DEFAULT '',
+    confirmed_at        TEXT,
+    sent_at             TEXT,
+    error_message       TEXT NOT NULL DEFAULT '',
+    created_at          TEXT NOT NULL,
+    updated_at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_followup_customer ON follow_ups(customer_id);
+CREATE INDEX IF NOT EXISTS idx_followup_status ON follow_ups(status);
+"""
+
+
+def get_connection() -> sqlite3.Connection:
+    conn = sqlite3.connect(_DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db():
+    conn = get_connection()
+    conn.executescript(_SCHEMA_SQL)
+    conn.close()
+    logger.info(f"Database initialized at {_DB_PATH}")
+
+
+# ── Customer CRUD ──────────────────────────────────────────────
+
+
+def upsert_customer(wechat_user_id: str, name: str, group_chat_id: str = "",
+                    group_chat_name: str = "") -> int:
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT id FROM customers WHERE wechat_user_id = ?",
+            (wechat_user_id,)
+        ).fetchone()
+        if row:
+            conn.execute(
+                "UPDATE customers SET name=?, group_chat_id=?, group_chat_name=?, last_seen_at=? WHERE id=?",
+                (name, group_chat_id, group_chat_name, now, row["id"])
+            )
+            conn.commit()
+            return row["id"]
+        else:
+            cur = conn.execute(
+                "INSERT INTO customers (wechat_user_id, name, group_chat_id, group_chat_name, first_seen_at, last_seen_at) VALUES (?,?,?,?,?,?)",
+                (wechat_user_id, name, group_chat_id, group_chat_name, now, now)
+            )
+            conn.commit()
+            return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_customer(customer_id: int) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM customers WHERE id=?", (customer_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_customers(limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM customers ORDER BY last_seen_at DESC LIMIT ? OFFSET ?",
+            (limit, offset)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Message CRUD ───────────────────────────────────────────────
+
+
+def insert_message(customer_id: int, content: str, msg_type: str = "text",
+                   group_chat_id: str = "", msg_id: str | None = None,
+                   received_at: str | None = None) -> int | None:
+    now = received_at or datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        if msg_id:
+            existing = conn.execute("SELECT id FROM messages WHERE msg_id=?", (msg_id,)).fetchone()
+            if existing:
+                return None  # duplicate
+        cur = conn.execute(
+            "INSERT INTO messages (msg_id, customer_id, content, msg_type, group_chat_id, received_at) VALUES (?,?,?,?,?,?)",
+            (msg_id, customer_id, content, msg_type, group_chat_id, now)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def get_unprocessed_messages(limit: int = 20) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE processed=0 AND msg_type='text' ORDER BY received_at ASC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def mark_message_processed(message_id: int):
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE messages SET processed=1 WHERE id=?", (message_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_messages_by_customer(customer_id: int, limit: int = 50) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM messages WHERE customer_id=? ORDER BY received_at DESC LIMIT ?",
+            (customer_id, limit)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def list_messages(customer_id: int | None = None, group_chat_id: str | None = None,
+                  limit: int = 100, offset: int = 0) -> list[dict]:
+    conn = get_connection()
+    try:
+        sql = """
+            SELECT m.*, c.name as customer_name, c.wechat_user_id
+            FROM messages m JOIN customers c ON m.customer_id = c.id
+            WHERE 1=1
+        """
+        params: list = []
+        if customer_id is not None:
+            sql += " AND m.customer_id=?"
+            params.append(customer_id)
+        if group_chat_id:
+            sql += " AND m.group_chat_id=?"
+            params.append(group_chat_id)
+        sql += " ORDER BY m.received_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Intent Analysis CRUD ───────────────────────────────────────
+
+
+def insert_intent_analysis(message_id: int, customer_id: int, intent_level: str,
+                           intent_score: float, intent_summary: str,
+                           keywords: str = "[]", raw_response: str = "") -> int:
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "INSERT INTO intent_analyses (message_id, customer_id, intent_level, intent_score, intent_summary, keywords, raw_response, analyzed_at) VALUES (?,?,?,?,?,?,?,?)",
+            (message_id, customer_id, intent_level, intent_score, intent_summary, keywords, raw_response, now)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def mark_intent_notified(analysis_id: int):
+    conn = get_connection()
+    try:
+        conn.execute("UPDATE intent_analyses SET notified=1 WHERE id=?", (analysis_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_high_intent_leads(intent_level: str | None = None,
+                          limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = get_connection()
+    try:
+        sql = """
+            SELECT ia.*, c.name as customer_name, c.wechat_user_id, c.group_chat_name,
+                   m.content as message_content, m.received_at as message_time
+            FROM intent_analyses ia
+            JOIN customers c ON ia.customer_id = c.id
+            JOIN messages m ON ia.message_id = m.id
+            WHERE 1=1
+        """
+        params: list = []
+        if intent_level:
+            sql += " AND ia.intent_level=?"
+            params.append(intent_level)
+        else:
+            sql += " AND ia.intent_level IN ('high','medium')"
+        sql += " ORDER BY ia.intent_score DESC, ia.analyzed_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Follow-up CRUD ─────────────────────────────────────────────
+
+
+def create_follow_up(customer_id: int, intent_analysis_id: int | None = None,
+                     target_user_id: str = "", target_group_id: str = "") -> int:
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "INSERT INTO follow_ups (customer_id, intent_analysis_id, target_user_id, target_group_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+            (customer_id, intent_analysis_id, target_user_id, target_group_id, "pending", now, now)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_follow_up(follow_up_id: int, **kwargs):
+    if not kwargs:
+        return
+    kwargs["updated_at"] = datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        set_parts = [f"{k}=?" for k in kwargs]
+        values = list(kwargs.values()) + [follow_up_id]
+        conn.execute(
+            f"UPDATE follow_ups SET {', '.join(set_parts)} WHERE id=?",
+            values
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_follow_up(follow_up_id: int) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM follow_ups WHERE id=?", (follow_up_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def get_follow_ups(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+    conn = get_connection()
+    try:
+        sql = """
+            SELECT f.*, c.name as customer_name, c.wechat_user_id, c.group_chat_name
+            FROM follow_ups f JOIN customers c ON f.customer_id = c.id
+            WHERE 1=1
+        """
+        params: list = []
+        if status:
+            sql += " AND f.status=?"
+            params.append(status)
+        sql += " ORDER BY f.updated_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_pending_follow_ups() -> list[dict]:
+    """Get follow-ups that are ready to be sent (status='message_generated')."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("""
+            SELECT f.*, c.name as customer_name, c.wechat_user_id
+            FROM follow_ups f JOIN customers c ON f.customer_id = c.id
+            WHERE f.status = 'message_generated'
+            ORDER BY f.updated_at ASC
+        """).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+# ── Dashboard Stats ────────────────────────────────────────────
+
+
+def get_dashboard_stats() -> dict:
+    conn = get_connection()
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        today_msgs = conn.execute(
+            "SELECT COUNT(*) as cnt FROM messages WHERE received_at >= ?", (today,)
+        ).fetchone()["cnt"]
+        high_leads = conn.execute(
+            "SELECT COUNT(*) as cnt FROM intent_analyses WHERE intent_level IN ('high','medium')"
+        ).fetchone()["cnt"]
+        pending_followups = conn.execute(
+            "SELECT COUNT(*) as cnt FROM follow_ups WHERE status IN ('pending','confirmed','message_generated')"
+        ).fetchone()["cnt"]
+        sent_followups = conn.execute(
+            "SELECT COUNT(*) as cnt FROM follow_ups WHERE status='sent'"
+        ).fetchone()["cnt"]
+        total_customers = conn.execute(
+            "SELECT COUNT(*) as cnt FROM customers"
+        ).fetchone()["cnt"]
+        total_messages = conn.execute(
+            "SELECT COUNT(*) as cnt FROM messages"
+        ).fetchone()["cnt"]
+        return {
+            "today_messages": today_msgs,
+            "high_intent_leads": high_leads,
+            "pending_follow_ups": pending_followups,
+            "sent_follow_ups": sent_followups,
+            "total_customers": total_customers,
+            "total_messages": total_messages,
+        }
+    finally:
+        conn.close()
