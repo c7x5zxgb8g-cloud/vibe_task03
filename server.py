@@ -39,8 +39,12 @@ _FEEDBACK_RULES_PATH = os.path.join(_BASE_DIR, "feedback_rules.json")
 _MATERIALS_DIR = os.path.join(_BASE_DIR, "docs", "理博基金知识库")
 
 
+_KB_STAGING_DIR = os.path.join(_BASE_DIR, "uploads", "kb_staging")
+
+
 def _ensure_dirs():
     os.makedirs(_WECHAT_IMAGE_DIR, exist_ok=True)
+    os.makedirs(_KB_STAGING_DIR, exist_ok=True)
 
 
 def _load_json(path, default=None):
@@ -155,6 +159,14 @@ class FollowUpConfirmRequest(BaseModel):
 class FollowUpSendRequest(BaseModel):
     follow_up_id: int
     message: str = ""
+
+
+class KBChunkEditRequest(BaseModel):
+    category: str = ""
+    keywords: str = ""
+    summary: str = ""
+    importance: str = "中"
+    related_products: str = ""
 
 
 # ── API Endpoints ────────────────────────────────────────────────
@@ -603,6 +615,250 @@ async def admin_list_follow_ups(
     from database import get_follow_ups
     follow_ups = get_follow_ups(status=status, limit=limit, offset=offset)
     return {"follow_ups": follow_ups}
+
+
+# ── Knowledge Base Admin API ──────────────────────────────────
+
+
+def _process_kb_document(doc_id: int):
+    """Background task (sync): parse, chunk, label a document and store results in SQLite."""
+    from database import update_kb_document, insert_kb_chunks, get_kb_document
+    from parsers.router import parse_file
+    from chunkers.text_chunker import chunk_document
+    from labelers.llm_labeler import label_chunks
+
+    try:
+        doc = get_kb_document(doc_id)
+        if not doc:
+            return
+
+        update_kb_document(doc_id, status="processing")
+
+        # Parse
+        parsed = parse_file(doc["storage_path"])
+
+        # Chunk
+        chunks = chunk_document(parsed)
+        if not chunks:
+            update_kb_document(doc_id, status="failed",
+                               error_message="文档解析后无有效内容")
+            return
+
+        # Label via LLM
+        chunks = label_chunks(chunks)
+
+        # Store chunks into SQLite staging table
+        chunks_data = []
+        for c in chunks:
+            chunks_data.append({
+                "chunk_index": c.chunk_index,
+                "text": c.text,
+                "page_number": c.metadata.get("page_number", 0),
+                "category": c.category or "其他",
+                "keywords": ", ".join(c.keywords) if c.keywords else "",
+                "summary": c.summary or "",
+                "importance": "中",
+                "related_products": "",
+            })
+        insert_kb_chunks(doc_id, chunks_data)
+
+        update_kb_document(
+            doc_id,
+            status="ready",
+            total_pages=len(parsed.pages),
+            total_chunks=len(chunks),
+            processed_at=datetime.now().isoformat(),
+        )
+        logger.info(f"KB document {doc_id} processed: {len(chunks)} chunks")
+
+    except Exception as e:
+        logger.error(f"KB document {doc_id} processing failed: {e}")
+        update_kb_document(doc_id, status="failed", error_message=str(e)[:500])
+
+
+@app.post("/api/admin/kb/upload")
+async def admin_kb_upload(
+    file: UploadFile = File(...),
+    authorization: str | None = Header(None),
+):
+    """Upload a document for knowledge base processing."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="文件名不能为空")
+
+    # Save file to staging directory
+    _ensure_dirs()
+    safe_name = f"{datetime.now().strftime('%Y%m%d%H%M%S')}_{file.filename}"
+    save_path = os.path.join(_KB_STAGING_DIR, safe_name)
+    content = await file.read()
+    with open(save_path, "wb") as f:
+        f.write(content)
+
+    ext = os.path.splitext(file.filename)[1].lower()
+    from database import insert_kb_document
+    doc_id = insert_kb_document(
+        file_name=file.filename,
+        file_type=ext,
+        file_size=len(content),
+        storage_path=save_path,
+    )
+
+    # Process in background thread
+    asyncio.create_task(asyncio.to_thread(_process_kb_document, doc_id))
+
+    return {"status": "ok", "document_id": doc_id, "file_name": file.filename}
+
+
+@app.get("/api/admin/kb/documents")
+async def admin_kb_list_documents(
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+    authorization: str | None = Header(None),
+):
+    """List knowledge base documents."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import list_kb_documents, get_kb_document_stats
+    docs = list_kb_documents(status=status, limit=limit, offset=offset)
+    stats = get_kb_document_stats()
+    return {"documents": docs, "stats": stats}
+
+
+@app.get("/api/admin/kb/documents/{doc_id}")
+async def admin_kb_document_detail(
+    doc_id: int,
+    authorization: str | None = Header(None),
+):
+    """Get document detail with all chunks."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_kb_document, list_kb_chunks
+    doc = get_kb_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    chunks = list_kb_chunks(doc_id)
+    return {"document": doc, "chunks": chunks}
+
+
+@app.put("/api/admin/kb/chunks/{chunk_id}")
+async def admin_kb_edit_chunk(
+    chunk_id: int,
+    req: KBChunkEditRequest,
+    authorization: str | None = Header(None),
+):
+    """Edit a single chunk's labels."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_kb_chunk, update_kb_chunk
+    chunk = get_kb_chunk(chunk_id)
+    if not chunk:
+        raise HTTPException(status_code=404, detail="切片不存在")
+    update_kb_chunk(
+        chunk_id,
+        category=req.category,
+        keywords=req.keywords,
+        summary=req.summary,
+        importance=req.importance,
+        related_products=req.related_products,
+        manually_edited=1,
+    )
+    return {"status": "ok"}
+
+
+@app.post("/api/admin/kb/documents/{doc_id}/publish")
+async def admin_kb_publish(
+    doc_id: int,
+    authorization: str | None = Header(None),
+):
+    """Publish document chunks to ChromaDB knowledge base."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_kb_document, list_kb_chunks, update_kb_document
+    from chunkers.text_chunker import Chunk
+
+    doc = get_kb_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+    if doc["status"] not in ("ready", "published"):
+        raise HTTPException(status_code=400, detail=f"文档状态不正确: {doc['status']}")
+
+    chunks_data = list_kb_chunks(doc_id)
+    if not chunks_data:
+        raise HTTPException(status_code=400, detail="文档没有切片数据")
+
+    # Rebuild Chunk objects for ChromaStore
+    chunks = []
+    for c in chunks_data:
+        chunk = Chunk(
+            text=c["text"],
+            chunk_index=c["chunk_index"],
+            metadata={
+                "source_file": doc["file_name"],
+                "source_path": doc.get("storage_path", ""),
+                "file_type": doc["file_type"],
+                "page_number": c["page_number"],
+                "importance": c["importance"],
+                "related_products": c["related_products"],
+            },
+            category=c["category"],
+            keywords=[k.strip() for k in c["keywords"].split(",") if k.strip()] if c["keywords"] else [],
+            summary=c["summary"],
+        )
+        chunks.append(chunk)
+
+    # If previously published, delete old data from ChromaDB first
+    if doc["status"] == "published":
+        try:
+            _rag_engine._store.delete_by_source(doc["file_name"])
+        except Exception as e:
+            logger.warning(f"Failed to delete old chunks for {doc['file_name']}: {e}")
+
+    # Add to ChromaDB
+    added = await asyncio.to_thread(_rag_engine._store.add_chunks, chunks)
+
+    update_kb_document(
+        doc_id,
+        status="published",
+        published_at=datetime.now().isoformat(),
+    )
+
+    return {"status": "ok", "chunks_published": added}
+
+
+@app.delete("/api/admin/kb/documents/{doc_id}")
+async def admin_kb_delete_document(
+    doc_id: int,
+    authorization: str | None = Header(None),
+):
+    """Delete a document and its chunks. Also remove from ChromaDB if published."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_kb_document, delete_kb_document
+
+    doc = get_kb_document(doc_id)
+    if not doc:
+        raise HTTPException(status_code=404, detail="文档不存在")
+
+    # Remove from ChromaDB if published
+    if doc["status"] == "published":
+        try:
+            _rag_engine._store.delete_by_source(doc["file_name"])
+        except Exception as e:
+            logger.warning(f"Failed to delete from ChromaDB: {e}")
+
+    # Remove staging file
+    if doc["storage_path"] and os.path.exists(doc["storage_path"]):
+        try:
+            os.remove(doc["storage_path"])
+        except Exception:
+            pass
+
+    # Delete from SQLite (CASCADE deletes chunks)
+    delete_kb_document(doc_id)
+    return {"status": "ok"}
 
 
 # ── Serve static files ───────────────────────────────────────────
@@ -1259,6 +1515,38 @@ _ADMIN_HTML = """\
   .msg-item { padding: 8px 12px; border-left: 3px solid #dde3ea; margin-bottom: 6px; background: #fafbfc; border-radius: 0 8px 8px 0; }
   .msg-item .msg-meta { font-size: 11px; color: #999; margin-bottom: 2px; }
   .msg-item .msg-text { font-size: 13px; color: #333; line-height: 1.6; }
+
+  /* KB Upload */
+  .upload-zone { border: 2px dashed #c5cdd8; border-radius: 12px; padding: 40px; text-align: center; cursor: pointer; transition: all .2s; background: #fafbfc; margin-bottom: 20px; }
+  .upload-zone:hover, .upload-zone.drag-over { border-color: #2c5f8a; background: #eef3f8; }
+  .upload-zone .icon { font-size: 36px; margin-bottom: 10px; }
+  .upload-zone .text { font-size: 14px; color: #666; }
+  .upload-zone .hint { font-size: 12px; color: #999; margin-top: 6px; }
+  .upload-zone input[type=file] { display: none; }
+
+  .kb-status { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .kb-status.uploaded { background: #e3f2fd; color: #1565c0; }
+  .kb-status.processing { background: #fff3e0; color: #e65100; }
+  .kb-status.ready { background: #e8f5e9; color: #2e7d32; }
+  .kb-status.published { background: #ede7f6; color: #4527a0; }
+  .kb-status.failed { background: #fce4ec; color: #c62828; }
+
+  /* Chunk review modal (large) */
+  .modal-lg { max-width: 900px; width: 95%; }
+  .chunk-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  .chunk-table th { background: #f8f9fb; padding: 8px 10px; text-align: left; font-size: 11px; color: #888; font-weight: 600; position: sticky; top: 0; }
+  .chunk-table td { padding: 8px 10px; border-top: 1px solid #f0f0f0; vertical-align: top; }
+  .chunk-text-preview { max-width: 280px; max-height: 60px; overflow: hidden; text-overflow: ellipsis; font-size: 12px; color: #555; line-height: 1.5; }
+
+  /* Chunk edit form */
+  .edit-form label { font-size: 13px; color: #555; display: block; margin: 12px 0 4px; font-weight: 500; }
+  .edit-form select, .edit-form input[type=text] { width: 100%; border: 1.5px solid #dde3ea; border-radius: 8px; padding: 8px 12px; font-size: 13px; outline: none; font-family: inherit; }
+  .edit-form select:focus, .edit-form input[type=text]:focus { border-color: #2c5f8a; }
+  .edit-form .checkbox-group { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 4px; }
+  .edit-form .checkbox-group label { display: flex; align-items: center; gap: 4px; font-weight: 400; margin: 0; cursor: pointer; }
+  .edit-form .chunk-preview { background: #f5f6fa; border-radius: 8px; padding: 12px; max-height: 120px; overflow-y: auto; font-size: 12px; color: #555; line-height: 1.6; margin-bottom: 8px; }
+  .kb-stats-row { display: flex; gap: 16px; margin-bottom: 16px; }
+  .kb-stats-row .stat-card { flex: 1; }
 </style>
 </head>
 <body>
@@ -1286,6 +1574,7 @@ _ADMIN_HTML = """\
   <div class="tab" onclick="switchTab('leads')">客户线索</div>
   <div class="tab" onclick="switchTab('followups')">跟进管理</div>
   <div class="tab" onclick="switchTab('messages')">消息记录</div>
+  <div class="tab" onclick="switchTab('kb')">知识库管理</div>
 </div>
 
 <div class="content">
@@ -1348,6 +1637,100 @@ _ADMIN_HTML = """\
     </div>
   </div>
 
+  <!-- Knowledge Base -->
+  <div class="panel" id="panel-kb">
+    <div class="kb-stats-row" id="kbStatsRow"></div>
+
+    <div class="upload-zone" id="uploadZone" onclick="document.getElementById('kbFileInput').click()">
+      <div class="icon">&#128196;</div>
+      <div class="text">点击或拖拽文件到此区域上传</div>
+      <div class="hint">支持 PDF / DOCX / PPTX / Excel / 图片 / TXT</div>
+      <input type="file" id="kbFileInput" accept=".pdf,.docx,.pptx,.xlsx,.xls,.png,.jpg,.jpeg,.gif,.bmp,.txt,.md,.csv" onchange="handleKBUpload(this)">
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <h3>文档列表</h3>
+        <div class="filter-btns">
+          <button class="filter-btn active" onclick="filterKBDocs(null, this)">全部</button>
+          <button class="filter-btn" onclick="filterKBDocs('processing', this)">处理中</button>
+          <button class="filter-btn" onclick="filterKBDocs('ready', this)">待发布</button>
+          <button class="filter-btn" onclick="filterKBDocs('published', this)">已发布</button>
+        </div>
+      </div>
+      <table>
+        <thead><tr><th>文件名</th><th>类型</th><th>大小</th><th>切片数</th><th>状态</th><th>上传时间</th><th>操作</th></tr></thead>
+        <tbody id="kbDocsBody"></tbody>
+      </table>
+      <div class="empty" id="kbDocsEmpty" style="display:none;">暂无文档</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Chunk review modal -->
+<div class="modal-overlay" id="chunkReviewModal">
+  <div class="modal modal-lg" style="max-height:90vh;">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px;">
+      <h3 style="margin:0;" id="chunkReviewTitle">切片审核</h3>
+      <button class="btn btn-primary" id="publishFromReviewBtn" onclick="doPublishDoc()" style="margin-left:auto;">发布到知识库</button>
+      <button class="btn" style="background:#f5f5f5;color:#666;border:1px solid #ddd;" onclick="closeModal('chunkReviewModal')">关闭</button>
+    </div>
+    <div style="overflow-y:auto;max-height:calc(90vh - 100px);">
+      <table class="chunk-table">
+        <thead><tr><th>#</th><th>内容预览</th><th>分类</th><th>关键词</th><th>摘要</th><th>重要程度</th><th>关联产品</th><th>操作</th></tr></thead>
+        <tbody id="chunkReviewBody"></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<!-- Chunk edit modal -->
+<div class="modal-overlay" id="chunkEditModal">
+  <div class="modal" style="max-width:550px;">
+    <h3>编辑切片标注</h3>
+    <div class="edit-form">
+      <div class="chunk-preview" id="editChunkPreview"></div>
+      <label>分类</label>
+      <select id="editCategory">
+        <option value="市场分析">市场分析</option>
+        <option value="投资策略">投资策略</option>
+        <option value="风险提示">风险提示</option>
+        <option value="产品说明">产品说明</option>
+        <option value="法规政策">法规政策</option>
+        <option value="公司研究">公司研究</option>
+        <option value="行业研究">行业研究</option>
+        <option value="宏观经济">宏观经济</option>
+        <option value="技术分析">技术分析</option>
+        <option value="客户服务">客户服务</option>
+        <option value="财务数据">财务数据</option>
+        <option value="其他">其他</option>
+      </select>
+      <label>关键词（逗号分隔）</label>
+      <input type="text" id="editKeywords" placeholder="关键词1, 关键词2, ...">
+      <label>摘要</label>
+      <input type="text" id="editSummary" placeholder="一句话概括核心内容">
+      <label>重要程度</label>
+      <select id="editImportance">
+        <option value="高">高</option>
+        <option value="中" selected>中</option>
+        <option value="低">低</option>
+      </select>
+      <label>关联产品</label>
+      <div class="checkbox-group" id="editProducts">
+        <label><input type="checkbox" value="理博1号"> 理博1号</label>
+        <label><input type="checkbox" value="远景1号"> 远景1号</label>
+        <label><input type="checkbox" value="远景2号"> 远景2号</label>
+        <label><input type="checkbox" value="飞天1号"> 飞天1号</label>
+        <label><input type="checkbox" value="万象7号"> 万象7号</label>
+        <label><input type="checkbox" value="其他"> 其他</label>
+      </div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" style="background:#f5f5f5;color:#666;border:1px solid #ddd;" onclick="closeModal('chunkEditModal')">取消</button>
+      <button class="btn btn-primary" onclick="doSaveChunkEdit()">保存</button>
+    </div>
+  </div>
 </div>
 
 <!-- Confirm follow-up modal -->
@@ -1434,10 +1817,9 @@ async function apiFetch(url, method = 'GET', body = null) {
 }
 
 function switchTab(name) {
-  document.querySelectorAll('.tab').forEach((t, i) => {
-    t.classList.toggle('active', t.textContent.includes(
-      name === 'dashboard' ? '仪表盘' : name === 'leads' ? '客户线索' : name === 'followups' ? '跟进管理' : '消息记录'
-    ));
+  const tabNames = { dashboard: '仪表盘', leads: '客户线索', followups: '跟进管理', messages: '消息记录', kb: '知识库管理' };
+  document.querySelectorAll('.tab').forEach(t => {
+    t.classList.toggle('active', t.textContent.includes(tabNames[name] || ''));
   });
   document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
   document.getElementById('panel-' + name).classList.add('active');
@@ -1446,6 +1828,7 @@ function switchTab(name) {
   else if (name === 'leads') loadLeads();
   else if (name === 'followups') loadFollowUps();
   else if (name === 'messages') loadMessages();
+  else if (name === 'kb') loadKBDocuments();
 }
 
 // Dashboard
@@ -1676,6 +2059,243 @@ function formatTime(t) {
   if (!t) return '-';
   try { return new Date(t).toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }); }
   catch(e) { return t; }
+}
+
+// ── Knowledge Base Management ─────────────────────────────
+
+let currentKBFilter = null;
+let currentReviewDocId = null;
+let editingChunkId = null;
+
+// Upload zone drag & drop
+(function() {
+  const zone = document.getElementById('uploadZone');
+  if (!zone) return;
+  zone.addEventListener('dragover', function(e) { e.preventDefault(); zone.classList.add('drag-over'); });
+  zone.addEventListener('dragleave', function() { zone.classList.remove('drag-over'); });
+  zone.addEventListener('drop', function(e) {
+    e.preventDefault();
+    zone.classList.remove('drag-over');
+    if (e.dataTransfer.files.length > 0) uploadKBFile(e.dataTransfer.files[0]);
+  });
+})();
+
+function handleKBUpload(input) {
+  if (input.files.length > 0) {
+    uploadKBFile(input.files[0]);
+    input.value = '';
+  }
+}
+
+async function uploadKBFile(file) {
+  const zone = document.getElementById('uploadZone');
+  const origText = zone.querySelector('.text').textContent;
+  zone.querySelector('.text').textContent = '上传中: ' + file.name + ' ...';
+  try {
+    const formData = new FormData();
+    formData.append('file', file);
+    const res = await fetch('/api/admin/kb/upload', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + token },
+      body: formData
+    });
+    if (res.status === 401) { document.getElementById('loginOverlay').style.display = 'flex'; return; }
+    if (!res.ok) throw new Error(await res.text());
+    const d = await res.json();
+    zone.querySelector('.text').textContent = '上传成功! 文档正在处理中...';
+    setTimeout(function() { zone.querySelector('.text').textContent = origText; }, 3000);
+    loadKBDocuments();
+    // Poll for processing completion
+    pollDocStatus(d.document_id);
+  } catch(e) {
+    zone.querySelector('.text').textContent = '上传失败: ' + e.message;
+    setTimeout(function() { zone.querySelector('.text').textContent = origText; }, 5000);
+  }
+}
+
+function pollDocStatus(docId) {
+  let attempts = 0;
+  const iv = setInterval(async function() {
+    attempts++;
+    if (attempts > 120) { clearInterval(iv); return; } // max 10 min
+    try {
+      const d = await apiFetch('/api/admin/kb/documents/' + docId);
+      if (d.document && d.document.status !== 'processing' && d.document.status !== 'uploaded') {
+        clearInterval(iv);
+        loadKBDocuments();
+      }
+    } catch(e) { clearInterval(iv); }
+  }, 5000);
+}
+
+function kbStatusLabel(s) {
+  return { uploaded: '已上传', processing: '处理中', ready: '待发布', published: '已发布', failed: '失败' }[s] || s;
+}
+
+function formatFileSize(bytes) {
+  if (!bytes || bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB', 'GB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return (bytes / Math.pow(k, i)).toFixed(1) + ' ' + sizes[i];
+}
+
+async function loadKBDocuments(status) {
+  try {
+    let url = '/api/admin/kb/documents?limit=100';
+    if (status) url += '&status=' + status;
+    const d = await apiFetch(url);
+    // Update stats
+    if (d.stats) {
+      document.getElementById('kbStatsRow').innerHTML =
+        '<div class="stat-card"><div class="label">总文档数</div><div class="value">' + d.stats.total_documents + '</div></div>' +
+        '<div class="stat-card"><div class="label">已发布</div><div class="value">' + d.stats.published_documents + '</div></div>' +
+        '<div class="stat-card"><div class="label">待发布</div><div class="value">' + d.stats.ready_documents + '</div></div>' +
+        '<div class="stat-card"><div class="label">处理中</div><div class="value">' + d.stats.processing_documents + '</div></div>' +
+        '<div class="stat-card"><div class="label">总切片数</div><div class="value">' + d.stats.total_chunks + '</div></div>';
+    }
+    const body = document.getElementById('kbDocsBody');
+    const empty = document.getElementById('kbDocsEmpty');
+    if (!d.documents || d.documents.length === 0) {
+      body.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    body.innerHTML = d.documents.map(function(doc) {
+      let actions = '';
+      if (doc.status === 'ready' || doc.status === 'published') {
+        actions += '<button class="btn btn-primary btn-sm" onclick="openChunkReview(' + doc.id + ')">审核标注</button> ';
+      }
+      if (doc.status === 'ready') {
+        actions += '<button class="btn btn-success btn-sm" onclick="doPublishDocDirect(' + doc.id + ')">发布</button> ';
+      }
+      if (doc.status === 'failed') {
+        actions += '<span class="text-muted" title="' + esc(doc.error_message) + '">查看错误</span> ';
+      }
+      actions += '<button class="btn btn-sm" style="background:#fce4ec;color:#c62828;" onclick="doDeleteDoc(' + doc.id + ')">删除</button>';
+      return '<tr>' +
+        '<td><strong>' + esc(doc.file_name) + '</strong></td>' +
+        '<td>' + esc(doc.file_type) + '</td>' +
+        '<td>' + formatFileSize(doc.file_size) + '</td>' +
+        '<td>' + (doc.total_chunks || 0) + '</td>' +
+        '<td><span class="kb-status ' + doc.status + '">' + kbStatusLabel(doc.status) + '</span></td>' +
+        '<td class="text-muted">' + formatTime(doc.uploaded_at) + '</td>' +
+        '<td>' + actions + '</td>' +
+        '</tr>';
+    }).join('');
+  } catch(e) {}
+}
+
+function filterKBDocs(status, btn) {
+  currentKBFilter = status;
+  document.querySelectorAll('#panel-kb .filter-btn').forEach(function(b) { b.classList.remove('active'); });
+  btn.classList.add('active');
+  loadKBDocuments(status);
+}
+
+// Chunk review
+async function openChunkReview(docId) {
+  currentReviewDocId = docId;
+  try {
+    const d = await apiFetch('/api/admin/kb/documents/' + docId);
+    document.getElementById('chunkReviewTitle').textContent = '切片审核 - ' + (d.document.file_name || '');
+    const pubBtn = document.getElementById('publishFromReviewBtn');
+    pubBtn.style.display = (d.document.status === 'ready' || d.document.status === 'published') ? '' : 'none';
+    const body = document.getElementById('chunkReviewBody');
+    if (!d.chunks || d.chunks.length === 0) {
+      body.innerHTML = '<tr><td colspan="8" class="empty">暂无切片数据</td></tr>';
+    } else {
+      body.innerHTML = d.chunks.map(function(c) {
+        return '<tr>' +
+          '<td>' + c.chunk_index + '</td>' +
+          '<td><div class="chunk-text-preview">' + esc(c.text) + '</div></td>' +
+          '<td>' + esc(c.category) + '</td>' +
+          '<td>' + esc(c.keywords) + '</td>' +
+          '<td><div class="chunk-text-preview">' + esc(c.summary) + '</div></td>' +
+          '<td>' + esc(c.importance) + '</td>' +
+          '<td>' + esc(c.related_products || '-') + '</td>' +
+          '<td><button class="btn btn-primary btn-sm" onclick="openChunkEdit(' + c.id + ')">编辑</button></td>' +
+          '</tr>';
+      }).join('');
+    }
+    document.getElementById('chunkReviewModal').classList.add('show');
+  } catch(e) { alert('加载失败: ' + e.message); }
+}
+
+// Chunk edit
+async function openChunkEdit(chunkId) {
+  editingChunkId = chunkId;
+  try {
+    // Find chunk data from the review table
+    const d = await apiFetch('/api/admin/kb/documents/' + currentReviewDocId);
+    const chunk = d.chunks.find(function(c) { return c.id === chunkId; });
+    if (!chunk) { alert('切片不存在'); return; }
+    document.getElementById('editChunkPreview').textContent = chunk.text.substring(0, 500);
+    document.getElementById('editCategory').value = chunk.category || '其他';
+    document.getElementById('editKeywords').value = chunk.keywords || '';
+    document.getElementById('editSummary').value = chunk.summary || '';
+    document.getElementById('editImportance').value = chunk.importance || '中';
+    // Set product checkboxes
+    const products = (chunk.related_products || '').split(',').map(function(s) { return s.trim(); });
+    document.querySelectorAll('#editProducts input[type=checkbox]').forEach(function(cb) {
+      cb.checked = products.indexOf(cb.value) >= 0;
+    });
+    document.getElementById('chunkEditModal').classList.add('show');
+  } catch(e) { alert('加载失败: ' + e.message); }
+}
+
+async function doSaveChunkEdit() {
+  const category = document.getElementById('editCategory').value;
+  const keywords = document.getElementById('editKeywords').value;
+  const summary = document.getElementById('editSummary').value;
+  const importance = document.getElementById('editImportance').value;
+  const products = [];
+  document.querySelectorAll('#editProducts input[type=checkbox]:checked').forEach(function(cb) {
+    products.push(cb.value);
+  });
+  try {
+    await apiFetch('/api/admin/kb/chunks/' + editingChunkId, 'PUT', {
+      category: category,
+      keywords: keywords,
+      summary: summary,
+      importance: importance,
+      related_products: products.join(', ')
+    });
+    closeModal('chunkEditModal');
+    // Refresh chunk review
+    openChunkReview(currentReviewDocId);
+  } catch(e) { alert('保存失败: ' + e.message); }
+}
+
+// Publish
+async function doPublishDoc() {
+  if (!currentReviewDocId) return;
+  if (!confirm('确认将文档发布到知识库?')) return;
+  try {
+    const d = await apiFetch('/api/admin/kb/documents/' + currentReviewDocId + '/publish', 'POST');
+    alert('发布成功! 已写入 ' + (d.chunks_published || 0) + ' 个切片到知识库');
+    closeModal('chunkReviewModal');
+    loadKBDocuments(currentKBFilter);
+  } catch(e) { alert('发布失败: ' + e.message); }
+}
+
+async function doPublishDocDirect(docId) {
+  if (!confirm('确认将文档发布到知识库?')) return;
+  try {
+    const d = await apiFetch('/api/admin/kb/documents/' + docId + '/publish', 'POST');
+    alert('发布成功! 已写入 ' + (d.chunks_published || 0) + ' 个切片到知识库');
+    loadKBDocuments(currentKBFilter);
+  } catch(e) { alert('发布失败: ' + e.message); }
+}
+
+// Delete
+async function doDeleteDoc(docId) {
+  if (!confirm('确认删除此文档? 如已发布将同时从知识库中移除。')) return;
+  try {
+    await apiFetch('/api/admin/kb/documents/' + docId, 'DELETE');
+    loadKBDocuments(currentKBFilter);
+  } catch(e) { alert('删除失败: ' + e.message); }
 }
 </script>
 </body>

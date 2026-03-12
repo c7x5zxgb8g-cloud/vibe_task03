@@ -71,6 +71,38 @@ CREATE TABLE IF NOT EXISTS follow_ups (
 );
 CREATE INDEX IF NOT EXISTS idx_followup_customer ON follow_ups(customer_id);
 CREATE INDEX IF NOT EXISTS idx_followup_status ON follow_ups(status);
+
+CREATE TABLE IF NOT EXISTS kb_documents (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_name       TEXT NOT NULL,
+    file_type       TEXT NOT NULL DEFAULT '',
+    file_size       INTEGER NOT NULL DEFAULT 0,
+    storage_path    TEXT NOT NULL DEFAULT '',
+    status          TEXT NOT NULL DEFAULT 'uploaded',
+    total_pages     INTEGER NOT NULL DEFAULT 0,
+    total_chunks    INTEGER NOT NULL DEFAULT 0,
+    error_message   TEXT NOT NULL DEFAULT '',
+    uploaded_at     TEXT NOT NULL,
+    processed_at    TEXT,
+    published_at    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_kb_doc_status ON kb_documents(status);
+
+CREATE TABLE IF NOT EXISTS kb_chunks (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_id      INTEGER NOT NULL REFERENCES kb_documents(id) ON DELETE CASCADE,
+    chunk_index      INTEGER NOT NULL DEFAULT 0,
+    text             TEXT NOT NULL DEFAULT '',
+    page_number      INTEGER NOT NULL DEFAULT 0,
+    category         TEXT NOT NULL DEFAULT '',
+    keywords         TEXT NOT NULL DEFAULT '',
+    summary          TEXT NOT NULL DEFAULT '',
+    importance       TEXT NOT NULL DEFAULT '中',
+    related_products TEXT NOT NULL DEFAULT '',
+    manually_edited  INTEGER NOT NULL DEFAULT 0,
+    created_at       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_kb_chunk_doc ON kb_chunks(document_id);
 """
 
 
@@ -385,6 +417,167 @@ def get_dashboard_stats() -> dict:
             "sent_follow_ups": sent_followups,
             "total_customers": total_customers,
             "total_messages": total_messages,
+        }
+    finally:
+        conn.close()
+
+
+# ── Knowledge Base Document CRUD ──────────────────────────────
+
+
+def insert_kb_document(file_name: str, file_type: str, file_size: int,
+                       storage_path: str) -> int:
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        cur = conn.execute(
+            "INSERT INTO kb_documents (file_name, file_type, file_size, storage_path, status, uploaded_at) VALUES (?,?,?,?,?,?)",
+            (file_name, file_type, file_size, storage_path, "uploaded", now)
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def update_kb_document(doc_id: int, **kwargs):
+    if not kwargs:
+        return
+    conn = get_connection()
+    try:
+        set_parts = [f"{k}=?" for k in kwargs]
+        values = list(kwargs.values()) + [doc_id]
+        conn.execute(
+            f"UPDATE kb_documents SET {', '.join(set_parts)} WHERE id=?",
+            values
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_kb_document(doc_id: int) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM kb_documents WHERE id=?", (doc_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def list_kb_documents(status: str | None = None, limit: int = 50,
+                      offset: int = 0) -> list[dict]:
+    conn = get_connection()
+    try:
+        sql = "SELECT * FROM kb_documents WHERE 1=1"
+        params: list = []
+        if status:
+            sql += " AND status=?"
+            params.append(status)
+        sql += " ORDER BY uploaded_at DESC LIMIT ? OFFSET ?"
+        params.extend([limit, offset])
+        rows = conn.execute(sql, params).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def delete_kb_document(doc_id: int):
+    """Delete a document and all its chunks (CASCADE)."""
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM kb_documents WHERE id=?", (doc_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Knowledge Base Chunk CRUD ─────────────────────────────────
+
+
+def insert_kb_chunks(document_id: int, chunks_data: list[dict]):
+    """Bulk insert chunks for a document."""
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        for c in chunks_data:
+            conn.execute(
+                "INSERT INTO kb_chunks (document_id, chunk_index, text, page_number, category, keywords, summary, importance, related_products, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (
+                    document_id,
+                    c.get("chunk_index", 0),
+                    c.get("text", ""),
+                    c.get("page_number", 0),
+                    c.get("category", ""),
+                    c.get("keywords", ""),
+                    c.get("summary", ""),
+                    c.get("importance", "中"),
+                    c.get("related_products", ""),
+                    now,
+                )
+            )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def list_kb_chunks(document_id: int) -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute(
+            "SELECT * FROM kb_chunks WHERE document_id=? ORDER BY chunk_index ASC",
+            (document_id,)
+        ).fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def get_kb_chunk(chunk_id: int) -> dict | None:
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT * FROM kb_chunks WHERE id=?", (chunk_id,)).fetchone()
+        return dict(row) if row else None
+    finally:
+        conn.close()
+
+
+def update_kb_chunk(chunk_id: int, **kwargs):
+    if not kwargs:
+        return
+    conn = get_connection()
+    try:
+        set_parts = [f"{k}=?" for k in kwargs]
+        values = list(kwargs.values()) + [chunk_id]
+        conn.execute(
+            f"UPDATE kb_chunks SET {', '.join(set_parts)} WHERE id=?",
+            values
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_kb_document_stats() -> dict:
+    conn = get_connection()
+    try:
+        total_docs = conn.execute("SELECT COUNT(*) as cnt FROM kb_documents").fetchone()["cnt"]
+        published_docs = conn.execute(
+            "SELECT COUNT(*) as cnt FROM kb_documents WHERE status='published'"
+        ).fetchone()["cnt"]
+        processing_docs = conn.execute(
+            "SELECT COUNT(*) as cnt FROM kb_documents WHERE status='processing'"
+        ).fetchone()["cnt"]
+        ready_docs = conn.execute(
+            "SELECT COUNT(*) as cnt FROM kb_documents WHERE status='ready'"
+        ).fetchone()["cnt"]
+        total_chunks = conn.execute("SELECT COUNT(*) as cnt FROM kb_chunks").fetchone()["cnt"]
+        return {
+            "total_documents": total_docs,
+            "published_documents": published_docs,
+            "processing_documents": processing_docs,
+            "ready_documents": ready_docs,
+            "total_chunks": total_chunks,
         }
     finally:
         conn.close()
