@@ -76,7 +76,8 @@ async def lifespan(app: FastAPI):
     init_db()
 
     # Start background message processor
-    from background_tasks import start_message_processor, stop_message_processor
+    from background_tasks import start_message_processor, stop_message_processor, set_rag_engine
+    set_rag_engine(_rag_engine)
     processor_task = asyncio.create_task(start_message_processor())
 
     yield
@@ -361,17 +362,33 @@ async def webhook_get_pending_messages():
     """Get follow-up messages ready to be sent by the robot."""
     from database import get_pending_follow_ups
 
+    base_url = Config.ADMIN_BASE_URL.rstrip("/")
+
     pending = get_pending_follow_ups()
-    messages = [
-        {
+    messages = []
+    for f in pending:
+        # Parse attachment files and build full download URLs
+        attachment_files_raw = f.get("attachment_files", "[]")
+        try:
+            attachment_files = json.loads(attachment_files_raw) if attachment_files_raw else []
+        except (json.JSONDecodeError, TypeError):
+            attachment_files = []
+
+        file_downloads = []
+        for fname in attachment_files:
+            file_downloads.append({
+                "filename": fname,
+                "download_url": f"{base_url}/api/materials/{fname}",
+            })
+
+        messages.append({
             "follow_up_id": f["id"],
             "target_user_id": f["wechat_user_id"],
-            "target_group_id": f.get("target_group_id", ""),
+            "group_name": f.get("group_chat_name", ""),
             "content": f["generated_message"],
             "customer_name": f["customer_name"],
-        }
-        for f in pending
-    ]
+            "attachment_files": file_downloads,
+        })
     return {"messages": messages}
 
 
@@ -548,7 +565,7 @@ async def admin_confirm_follow_up(
     )
 
     # Generate follow-up message via DeepSeek
-    generated = await asyncio.to_thread(
+    result = await asyncio.to_thread(
         generate_followup_message,
         customer_name=customer["name"],
         message_content=latest_content,
@@ -557,11 +574,15 @@ async def admin_confirm_follow_up(
         admin_note=req.admin_note,
     )
 
+    generated = result.get("message", "") if result else ""
+    attachment_files = result.get("recommended_files", []) if result else []
+
     if generated:
         update_follow_up(
             follow_up_id,
             status="message_generated",
             generated_message=generated,
+            attachment_files=json.dumps(attachment_files, ensure_ascii=False),
         )
     else:
         update_follow_up(follow_up_id, status="failed", error_message="消息生成失败")
@@ -570,6 +591,7 @@ async def admin_confirm_follow_up(
         "status": "ok",
         "follow_up_id": follow_up_id,
         "generated_message": generated,
+        "attachment_files": attachment_files,
     }
 
 
@@ -1897,13 +1919,24 @@ async function loadFollowUps(status = null) {
     }
     empty.style.display = 'none';
     d.follow_ups.forEach(f => { _followUpCache[f.id] = f; });
-    body.innerHTML = d.follow_ups.map(f => `<tr>
+    body.innerHTML = d.follow_ups.map(f => {
+      let filesHtml = '';
+      try {
+        const files = JSON.parse(f.attachment_files || '[]');
+        if (files.length > 0) {
+          filesHtml = '<div style="margin-top:4px">' + files.map(fn =>
+            `<a href="/api/materials/${encodeURIComponent(fn)}" target="_blank" style="font-size:12px;color:#1a73e8;margin-right:8px">📎${esc(fn)}</a>`
+          ).join('') + '</div>';
+        }
+      } catch(e) {}
+      return `<tr>
       <td><strong>${esc(f.customer_name)}</strong></td>
       <td><span class="badge ${f.status}">${statusLabel(f.status)}</span></td>
-      <td><div class="text-truncate">${esc(f.generated_message || '-')}</div></td>
+      <td><div class="text-truncate">${esc(f.generated_message || '-')}${filesHtml}</div></td>
       <td class="text-muted">${formatTime(f.updated_at)}</td>
       <td>${renderFollowUpAction(f)}</td>
-    </tr>`).join('');
+    </tr>`;
+    }).join('');
   } catch(e) {}
 }
 
@@ -1984,7 +2017,13 @@ async function doConfirmFollowUp() {
     closeModal('confirmModal');
     if (d.generated_message) {
       pendingFollowUpId = d.follow_up_id;
-      document.getElementById('sendCustomerInfo').innerHTML = '<p>AI已生成跟进消息，您可以编辑后发送：</p>';
+      let filesInfo = '';
+      if (d.attachment_files && d.attachment_files.length > 0) {
+        filesInfo = '<p style="margin-top:8px;color:#666">附带文件：' + d.attachment_files.map(fn =>
+          `<a href="/api/materials/${encodeURIComponent(fn)}" target="_blank" style="color:#1a73e8">📎${esc(fn)}</a>`
+        ).join('  ') + '</p>';
+      }
+      document.getElementById('sendCustomerInfo').innerHTML = '<p>AI已生成跟进消息，您可以编辑后发送：</p>' + filesInfo;
       document.getElementById('sendMessage').value = d.generated_message;
       document.getElementById('sendModal').classList.add('show');
     } else {

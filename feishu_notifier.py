@@ -18,6 +18,8 @@ def notify_high_intent_lead(
     intent_summary: str,
     keywords: list[str],
     admin_page_url: str = "",
+    suggested_reply: str = "",
+    attachment_files: list[str] | None = None,
 ) -> bool:
     """Send a Feishu notification about a high-intent lead.
 
@@ -31,6 +33,41 @@ def notify_high_intent_lead(
     level_label = {"high": "高", "medium": "中"}.get(intent_level, intent_level)
     level_color = "red" if intent_level == "high" else "orange"
 
+    elements = [
+        {
+            "tag": "div",
+            "fields": [
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**客户**: {customer_name}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**来源群**: {group_chat_name}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**意向等级**: {level_label}"}},
+                {"is_short": True, "text": {"tag": "lark_md", "content": f"**意向分数**: {intent_score:.0%}"}},
+            ],
+        },
+        {"tag": "div", "text": {"tag": "lark_md", "content": f"**客户消息**:\n{message_content[:500]}"}},
+        {"tag": "div", "text": {"tag": "lark_md", "content": f"**判断依据**: {intent_summary}"}},
+        {"tag": "div", "text": {"tag": "lark_md", "content": f"**关键词**: {', '.join(keywords)}"}},
+    ]
+
+    # Add suggested reply if available
+    if suggested_reply:
+        elements.append({"tag": "hr"})
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**建议回复**:\n{suggested_reply[:500]}"}})
+
+    # Add attachment file info if available
+    if attachment_files:
+        base_url = admin_page_url or Config.ADMIN_BASE_URL
+        files_text = "\n".join(f"- [{f}]({base_url}/api/materials/{f})" for f in attachment_files)
+        elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"**推荐附件**:\n{files_text}"}})
+
+    elements.append({"tag": "hr"})
+    elements.append({
+        "tag": "div",
+        "text": {
+            "tag": "lark_md",
+            "content": f"请前往 [管理后台]({admin_page_url or Config.ADMIN_BASE_URL + '/admin'}) 确认跟进",
+        },
+    })
+
     card = {
         "msg_type": "interactive",
         "card": {
@@ -41,28 +78,7 @@ def notify_high_intent_lead(
                 },
                 "template": level_color,
             },
-            "elements": [
-                {
-                    "tag": "div",
-                    "fields": [
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**客户**: {customer_name}"}},
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**来源群**: {group_chat_name}"}},
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**意向等级**: {level_label}"}},
-                        {"is_short": True, "text": {"tag": "lark_md", "content": f"**意向分数**: {intent_score:.0%}"}},
-                    ],
-                },
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"**客户消息**:\n{message_content[:500]}"}},
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"**判断依据**: {intent_summary}"}},
-                {"tag": "div", "text": {"tag": "lark_md", "content": f"**关键词**: {', '.join(keywords)}"}},
-                {"tag": "hr"},
-                {
-                    "tag": "div",
-                    "text": {
-                        "tag": "lark_md",
-                        "content": f"请前往 [管理后台]({admin_page_url or Config.ADMIN_BASE_URL + '/admin'}) 确认跟进",
-                    },
-                },
-            ],
+            "elements": elements,
         },
     }
 

@@ -26,6 +26,21 @@ _INTENT_SYSTEM_PROMPT = """你是一个购买意向分析专家，专门分析�
 
 你需要分析客户消息中的购买意向，并给出判断结果。
 
+## 消息来源场景
+
+消息可能来自两种场景，你在判断时必须考虑场景差异：
+
+**私聊消息 (private)**:
+- 客户主动发起一对一对话，说明已对产品/公司有一定认知和兴趣
+- 同等内容下，私聊的意向分数应比群聊适当上浮 0.1~0.15
+- 即使是一般性询问，也暗含一定主动意向
+
+**群聊消息 (group)**:
+- 客户在群里发言，可能是回复他人、参与讨论、或泛泛聊天
+- 需要更保守地判断，区分是否针对我方产品/服务
+- 群内跟风附和、表情回复、与我方无关的讨论应判定为 none
+- 只有明确针对我方产品/服务的提问才提升意向等级
+
 ## 判断标准
 
 **高意向 (high)** - 分数 0.7-1.0:
@@ -54,6 +69,7 @@ _INTENT_SYSTEM_PROMPT = """你是一个购买意向分析专家，专门分析�
 - 闲聊、问候
 - 无关话题
 - 广告/垃圾信息
+- 群聊中与我方无关的讨论
 
 ## 输出格式 (严格JSON)
 
@@ -66,14 +82,18 @@ _INTENT_SYSTEM_PROMPT = """你是一个购买意向分析专家，专门分析�
 
 
 def analyze_intent(message_content: str, customer_name: str = "",
-                   recent_context: str = "") -> dict:
+                   recent_context: str = "", msg_source: str = "group") -> dict:
     """Analyze a message for purchase intent.
+
+    Args:
+        msg_source: "private" for 1-on-1 messages, "group" for group chat messages.
 
     Returns dict with: intent_level, intent_score, intent_summary, keywords, raw_response
     """
     client = _get_client()
 
-    user_prompt = f"客户名称: {customer_name}\n"
+    source_label = "私聊消息" if msg_source == "private" else "群聊消息"
+    user_prompt = f"消息来源: {source_label}\n客户名称: {customer_name}\n"
     if recent_context:
         user_prompt += f"近期消息上下文:\n{recent_context}\n\n"
     user_prompt += f"当前消息: {message_content}\n\n请分析购买意向:"

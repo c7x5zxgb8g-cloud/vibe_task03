@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS follow_ups (
     intent_analysis_id  INTEGER REFERENCES intent_analyses(id),
     status              TEXT NOT NULL DEFAULT 'pending',
     generated_message   TEXT NOT NULL DEFAULT '',
+    attachment_files    TEXT NOT NULL DEFAULT '[]',
     admin_note          TEXT NOT NULL DEFAULT '',
     target_user_id      TEXT NOT NULL DEFAULT '',
     target_group_id     TEXT NOT NULL DEFAULT '',
@@ -117,6 +118,15 @@ def get_connection() -> sqlite3.Connection:
 def init_db():
     conn = get_connection()
     conn.executescript(_SCHEMA_SQL)
+    # Migration: add attachment_files column if missing
+    try:
+        cols = [row[1] for row in conn.execute("PRAGMA table_info(follow_ups)").fetchall()]
+        if "attachment_files" not in cols:
+            conn.execute("ALTER TABLE follow_ups ADD COLUMN attachment_files TEXT NOT NULL DEFAULT '[]'")
+            conn.commit()
+            logger.info("Migrated follow_ups: added attachment_files column")
+    except Exception as e:
+        logger.warning(f"Migration check failed: {e}")
     conn.close()
     logger.info(f"Database initialized at {_DB_PATH}")
 
@@ -375,7 +385,7 @@ def get_pending_follow_ups() -> list[dict]:
     conn = get_connection()
     try:
         rows = conn.execute("""
-            SELECT f.*, c.name as customer_name, c.wechat_user_id
+            SELECT f.*, c.name as customer_name, c.wechat_user_id, c.group_chat_name
             FROM follow_ups f JOIN customers c ON f.customer_id = c.id
             WHERE f.status = 'message_generated'
             ORDER BY f.updated_at ASC
