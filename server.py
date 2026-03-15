@@ -388,10 +388,20 @@ async def webhook_get_pending_messages():
 
         file_downloads = []
         for fname in attachment_files:
-            file_downloads.append({
-                "filename": fname,
-                "download_url": f"{base_url}/api/materials/{fname}",
-            })
+            if fname.startswith("__wechat_card__:"):
+                # WeChat card image file
+                card_file = fname.split(":", 1)[1]
+                file_downloads.append({
+                    "filename": card_file,
+                    "type": "wechat_card",
+                    "download_url": f"{base_url}/static/wechat/{card_file}",
+                })
+            else:
+                file_downloads.append({
+                    "filename": fname,
+                    "type": "material",
+                    "download_url": f"{base_url}/api/materials/{fname}",
+                })
 
         messages.append({
             "follow_up_id": f["id"],
@@ -522,6 +532,33 @@ async def admin_list_messages(
     msgs = list_messages(customer_id=customer_id, group_chat_id=group_chat_id,
                          limit=limit, offset=offset)
     return {"messages": msgs}
+
+
+@app.delete("/api/admin/messages/{message_id}")
+async def admin_delete_message(
+    message_id: int,
+    authorization: str | None = Header(None),
+):
+    """Delete a single message and its related analyses/follow-ups."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import delete_message
+    deleted = delete_message(message_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="消息不存在")
+    return {"status": "ok", "message": f"消息 {message_id} 已删除"}
+
+
+@app.delete("/api/admin/messages")
+async def admin_delete_all_messages(
+    authorization: str | None = Header(None),
+):
+    """Delete all messages and related analyses/follow-ups."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import delete_all_messages
+    count = delete_all_messages()
+    return {"status": "ok", "message": f"已清空 {count} 条消息记录", "deleted_count": count}
 
 
 @app.post("/api/admin/follow-up/{customer_id}/confirm")

@@ -650,6 +650,64 @@ def remove_team_member(member_id: int):
         conn.close()
 
 
+# ── Message Management ────────────────────────────────────────
+
+
+def delete_message(message_id: int) -> bool:
+    """Delete a single message by ID. Also removes related intent_analyses and follow_ups.
+
+    Returns True if a message was deleted, False if not found.
+    """
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT id FROM messages WHERE id=?", (message_id,)).fetchone()
+        if not row:
+            return False
+        # Delete related intent analyses and their follow-ups
+        analysis_ids = [
+            r["id"] for r in conn.execute(
+                "SELECT id FROM intent_analyses WHERE message_id=?", (message_id,)
+            ).fetchall()
+        ]
+        if analysis_ids:
+            placeholders = ",".join("?" * len(analysis_ids))
+            conn.execute(
+                f"DELETE FROM follow_ups WHERE intent_analysis_id IN ({placeholders})",
+                analysis_ids,
+            )
+            conn.execute(
+                f"DELETE FROM intent_analyses WHERE id IN ({placeholders})",
+                analysis_ids,
+            )
+        conn.execute("DELETE FROM messages WHERE id=?", (message_id,))
+        conn.commit()
+        return True
+    finally:
+        conn.close()
+
+
+def delete_all_messages() -> int:
+    """Delete all messages and related intent_analyses and follow_ups.
+
+    Returns the number of messages deleted.
+    """
+    conn = get_connection()
+    try:
+        # Delete follow_ups linked to intent_analyses
+        conn.execute(
+            "DELETE FROM follow_ups WHERE intent_analysis_id IN (SELECT id FROM intent_analyses)"
+        )
+        # Delete all intent analyses
+        conn.execute("DELETE FROM intent_analyses")
+        # Count and delete messages
+        count = conn.execute("SELECT COUNT(*) as cnt FROM messages").fetchone()["cnt"]
+        conn.execute("DELETE FROM messages")
+        conn.commit()
+        return count
+    finally:
+        conn.close()
+
+
 def get_kb_document_stats() -> dict:
     conn = get_connection()
     try:

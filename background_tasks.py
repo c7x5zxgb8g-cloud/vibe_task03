@@ -2,6 +2,8 @@
 
 import asyncio
 import json
+import os
+import re
 from datetime import datetime
 
 from config import Config
@@ -27,7 +29,52 @@ _running = False
 # Reference to the RAG engine, set by the server at startup
 _rag_engine = None
 
+_BASE_DIR = os.path.dirname(__file__)
+_MATERIALS_DIR = os.path.join(_BASE_DIR, "docs", "理博基金知识库")
+_WECHAT_IMAGE_DIR = os.path.join(_BASE_DIR, "static", "wechat")
+
 _NO_ANSWER_REPLY = "这个问题我不太确定，我帮您问一下同事，稍后给您回复。"
+
+
+def _extract_attachments_from_reply(reply_text: str) -> tuple[str, list[str]]:
+    """Extract attachment markers from reply text and return cleaned text + file list.
+
+    Handles:
+      - [微信名片] → adds wechat card image to attachments
+      - [材料推荐:filename] → adds the file to attachments
+
+    Returns (cleaned_text, attachment_filenames)
+    """
+    attachments = []
+
+    # Extract [材料推荐:filename]
+    material_pattern = re.compile(r'\[材料推荐[:：]([^\]]+)\]')
+    for match in material_pattern.finditer(reply_text):
+        fname = match.group(1).strip()
+        fpath = os.path.join(_MATERIALS_DIR, fname)
+        if os.path.isfile(fpath):
+            attachments.append(fname)
+        else:
+            logger.warning(f"Material file not found: {fname}")
+    reply_text = material_pattern.sub('', reply_text)
+
+    # Extract [微信名片]
+    if '[微信名片]' in reply_text:
+        # Find the wechat card image file
+        wechat_card_file = None
+        if os.path.isdir(_WECHAT_IMAGE_DIR):
+            for f in os.listdir(_WECHAT_IMAGE_DIR):
+                if f.startswith('wechat_card'):
+                    wechat_card_file = f
+                    break
+        if wechat_card_file:
+            attachments.append(f"__wechat_card__:{wechat_card_file}")
+        reply_text = reply_text.replace('[微信名片]', '')
+
+    # Clean up extra whitespace/newlines left by marker removal
+    reply_text = re.sub(r'\n{3,}', '\n\n', reply_text).strip()
+
+    return reply_text, attachments
 
 
 def set_rag_engine(engine):
@@ -152,6 +199,9 @@ def _process_pending_messages():
                 else:
                     reply_text = _NO_ANSWER_REPLY
 
+                # Extract [微信名片] and [材料推荐:xxx] markers into attachment files
+                reply_text, reply_attachments = _extract_attachments_from_reply(reply_text)
+
                 # Auto-reply, no admin approval needed
                 follow_up_id = create_follow_up(
                     customer_id=msg["customer_id"],
@@ -163,16 +213,21 @@ def _process_pending_messages():
                     follow_up_id,
                     status="message_generated",
                     generated_message=reply_text,
+                    attachment_files=json.dumps(reply_attachments, ensure_ascii=False) if reply_attachments else "[]",
                     confirmed_at=datetime.now().isoformat(),
                 )
                 logger.info(
                     f"Auto-reply queued for group message {msg['id']} "
-                    f"from {customer['name']} (kb_match={kb_result and kb_result['has_answer']})"
+                    f"from {customer['name']} (kb_match={kb_result and kb_result['has_answer']}, "
+                    f"attachments={len(reply_attachments)})"
                 )
 
             elif msg_source == "private":
                 # Private chat: only reply if KB has answer
                 if kb_result and kb_result["has_answer"]:
+                    reply_text = kb_result["reply"]
+                    reply_text, reply_attachments = _extract_attachments_from_reply(reply_text)
+
                     follow_up_id = create_follow_up(
                         customer_id=msg["customer_id"],
                         intent_analysis_id=analysis_id,
@@ -182,12 +237,13 @@ def _process_pending_messages():
                     update_follow_up(
                         follow_up_id,
                         status="message_generated",
-                        generated_message=kb_result["reply"],
+                        generated_message=reply_text,
+                        attachment_files=json.dumps(reply_attachments, ensure_ascii=False) if reply_attachments else "[]",
                         confirmed_at=datetime.now().isoformat(),
                     )
                     logger.info(
                         f"Auto-reply queued for private message {msg['id']} "
-                        f"from {customer['name']}"
+                        f"from {customer['name']} (attachments={len(reply_attachments)})"
                     )
                 else:
                     logger.info(
