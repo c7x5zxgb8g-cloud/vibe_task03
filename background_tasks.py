@@ -121,8 +121,8 @@ def _process_pending_messages():
                 f"[{m['received_at']}] {m['content'][:100]}" for m in recent
             )
 
-            # Determine message source
-            msg_source = "private" if not msg.get("group_chat_id") else "group"
+            # Determine message source: group_chat_name is the key indicator
+            msg_source = "private" if not customer.get("group_chat_name") else "group"
 
             # ── Step 1: Intent analysis via DeepSeek ──
             result = analyze_intent(
