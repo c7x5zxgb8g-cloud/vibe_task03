@@ -403,12 +403,19 @@ async def webhook_get_pending_messages():
                     "download_url": f"{base_url}/api/materials/{fname}",
                 })
 
+        group_id = f.get("group_chat_id", "") or ""
+        is_group = bool(group_id)
+
         messages.append({
             "follow_up_id": f["id"],
+            "is_group": is_group,
             "target_user_id": f["wechat_user_id"],
+            "reply_to_user_id": f["wechat_user_id"],
+            "group_id": group_id,
             "group_name": f.get("group_chat_name", ""),
             "content": f["generated_message"],
             "customer_name": f["customer_name"],
+            "reply_type": f.get("reply_type", "auto"),
             "attachment_files": file_downloads,
         })
     return {"messages": messages}

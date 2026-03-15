@@ -414,12 +414,48 @@ def get_follow_ups(status: str | None = None, reply_type: str | None = None,
         conn.close()
 
 
+def has_recent_wechat_card(customer_id: int | None = None,
+                          group_chat_id: str | None = None,
+                          hours: int = 12) -> bool:
+    """Check if a wechat card was already sent recently.
+
+    Dedup dimensions:
+      - If group_chat_id is provided: check if ANY reply in that group within the
+        last `hours` already contains a wechat card (group-level dedup).
+      - Otherwise fall back to customer-level dedup.
+    """
+    from datetime import timedelta
+    conn = get_connection()
+    try:
+        cutoff_str = (datetime.now() - timedelta(hours=hours)).isoformat()
+
+        if group_chat_id:
+            # Group-level: join with customers to match group_chat_id
+            row = conn.execute(
+                """SELECT COUNT(*) as cnt FROM follow_ups f
+                   JOIN customers c ON f.customer_id = c.id
+                   WHERE c.group_chat_id = ?
+                     AND f.created_at >= ?
+                     AND f.attachment_files LIKE '%wechat_card%'""",
+                (group_chat_id, cutoff_str)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT COUNT(*) as cnt FROM follow_ups WHERE customer_id=? AND created_at>=? AND attachment_files LIKE '%wechat_card%'",
+                (customer_id, cutoff_str)
+            ).fetchone()
+        return row["cnt"] > 0
+    finally:
+        conn.close()
+
+
 def get_pending_follow_ups() -> list[dict]:
     """Get follow-ups that are ready to be sent (status='message_generated')."""
     conn = get_connection()
     try:
         rows = conn.execute("""
-            SELECT f.*, c.name as customer_name, c.wechat_user_id, c.group_chat_name
+            SELECT f.*, c.name as customer_name, c.wechat_user_id,
+                   c.group_chat_id, c.group_chat_name
             FROM follow_ups f JOIN customers c ON f.customer_id = c.id
             WHERE f.status = 'message_generated'
             ORDER BY f.updated_at ASC

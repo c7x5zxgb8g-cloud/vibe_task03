@@ -16,6 +16,7 @@ from database import (
     get_customer,
     create_follow_up,
     update_follow_up,
+    has_recent_wechat_card,
 )
 from intent_analyzer import analyze_intent
 from feishu_notifier import notify_high_intent_lead
@@ -192,6 +193,13 @@ def _process_pending_messages():
             # ── Step 2: Generate reply using RAG engine ──
             kb_result = _check_knowledge_base(msg["content"])
 
+            # Check if we recently sent a wechat card (group-level 12h dedup)
+            group_id = msg.get("group_chat_id") or customer.get("group_chat_id") or ""
+            if group_id:
+                skip_wechat_card = has_recent_wechat_card(group_chat_id=group_id, hours=12)
+            else:
+                skip_wechat_card = has_recent_wechat_card(customer_id=msg["customer_id"], hours=12)
+
             if msg_source == "group":
                 # Group chat: always reply
                 if kb_result and kb_result["has_answer"]:
@@ -201,6 +209,10 @@ def _process_pending_messages():
 
                 # Extract [微信名片] and [材料推荐:xxx] markers into attachment files
                 reply_text, reply_attachments = _extract_attachments_from_reply(reply_text)
+
+                # Remove wechat card if already sent recently
+                if skip_wechat_card:
+                    reply_attachments = [a for a in reply_attachments if not a.startswith("__wechat_card__:")]
 
                 # Auto-reply, no admin approval needed
                 follow_up_id = create_follow_up(
@@ -219,7 +231,7 @@ def _process_pending_messages():
                 logger.info(
                     f"Auto-reply queued for group message {msg['id']} "
                     f"from {customer['name']} (kb_match={kb_result and kb_result['has_answer']}, "
-                    f"attachments={len(reply_attachments)})"
+                    f"attachments={len(reply_attachments)}, card_skipped={skip_wechat_card})"
                 )
 
             elif msg_source == "private":
@@ -227,6 +239,10 @@ def _process_pending_messages():
                 if kb_result and kb_result["has_answer"]:
                     reply_text = kb_result["reply"]
                     reply_text, reply_attachments = _extract_attachments_from_reply(reply_text)
+
+                    # Remove wechat card if already sent recently
+                    if skip_wechat_card:
+                        reply_attachments = [a for a in reply_attachments if not a.startswith("__wechat_card__:")]
 
                     follow_up_id = create_follow_up(
                         customer_id=msg["customer_id"],
@@ -243,7 +259,7 @@ def _process_pending_messages():
                     )
                     logger.info(
                         f"Auto-reply queued for private message {msg['id']} "
-                        f"from {customer['name']} (attachments={len(reply_attachments)})"
+                        f"from {customer['name']} (attachments={len(reply_attachments)}, card_skipped={skip_wechat_card})"
                     )
                 else:
                     logger.info(
