@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from datetime import datetime
 
 from config import Config
 from database import (
@@ -26,9 +27,11 @@ _running = False
 # Reference to the RAG engine, set by the server at startup
 _rag_engine = None
 
+_NO_ANSWER_REPLY = "这个问题我不太确定，我帮您问一下同事，稍后给您回复。"
+
 
 def set_rag_engine(engine):
-    """Set the RAG engine reference for private chat auto-replies."""
+    """Set the RAG engine reference for message auto-replies."""
     global _rag_engine
     _rag_engine = engine
 
@@ -56,46 +59,48 @@ def stop_message_processor():
     logger.info("Background message processor stopped")
 
 
-def _check_knowledge_base_has_answer(query: str) -> dict | None:
+def _check_knowledge_base(query: str) -> dict | None:
     """Check if the knowledge base has a relevant answer for the query.
 
-    Returns dict with 'reply' key if a relevant answer exists, None otherwise.
-    Only replies when there are sufficiently relevant KB results.
+    Returns dict with 'reply' and 'has_answer' keys.
+    has_answer=True means KB had relevant content, False means no match.
     """
     if _rag_engine is None:
         return None
 
     try:
-        # Search the knowledge base for relevant content
         hits = _rag_engine._store.search(query, top_k=4)
-
-        # Filter for highly relevant results only (score > 0.5)
         relevant_hits = [h for h in hits if h.get("score", 0) > 0.5]
 
         if not relevant_hits:
             logger.info(f"No relevant KB content for query: {query[:50]}...")
-            return None
+            return {"reply": "", "has_answer": False}
 
-        # Generate answer using RAG engine
         reply = _rag_engine.chat(query=query, history=None, top_k=4)
 
         if not reply or "无法回答" in reply or "暂时出现问题" in reply:
-            return None
+            return {"reply": "", "has_answer": False}
 
-        return {"reply": reply}
+        return {"reply": reply, "has_answer": True}
     except Exception as e:
         logger.error(f"Knowledge base check failed: {e}")
         return None
 
 
 def _process_pending_messages():
-    """Process all pending messages: analyze intent + notify if high.
+    """Process all pending messages.
 
     Reply logic:
-    1. For high/medium intent: pre-generate suggested reply and notify
-       sales on Feishu for confirmation before sending.
-    2. For private chat messages: auto-reply ONLY if the answer exists
-       in the knowledge base. Otherwise skip and wait for manual reply.
+    1. Use RAG engine (project's own agent) to generate all replies.
+    2. Use DeepSeek only for intent analysis (whether to follow up for sales).
+    3. Group chat messages:
+       - KB has answer → auto-reply directly (no admin approval needed)
+       - KB no answer → reply "不太确定，帮您问同事" (no admin approval needed)
+    4. Private chat messages:
+       - KB has answer → auto-reply directly (no admin approval needed)
+       - KB no answer → do NOT reply, wait for manual handling
+    5. High/medium intent (any source) → also create a follow-up record
+       that requires admin approval before sending (跟单消息).
     """
     messages = get_unprocessed_messages(limit=10)
 
@@ -106,7 +111,6 @@ def _process_pending_messages():
                 mark_message_processed(msg["id"])
                 continue
 
-            # Skip very short messages (greetings, etc.)
             if len(msg["content"].strip()) < 4:
                 mark_message_processed(msg["id"])
                 continue
@@ -117,10 +121,10 @@ def _process_pending_messages():
                 f"[{m['received_at']}] {m['content'][:100]}" for m in recent
             )
 
-            # Determine message source: private or group
+            # Determine message source
             msg_source = "private" if not msg.get("group_chat_id") else "group"
 
-            # Analyze intent via DeepSeek
+            # ── Step 1: Intent analysis via DeepSeek ──
             result = analyze_intent(
                 message_content=msg["content"],
                 customer_name=customer["name"],
@@ -128,7 +132,6 @@ def _process_pending_messages():
                 msg_source=msg_source,
             )
 
-            # Store analysis
             analysis_id = insert_intent_analysis(
                 message_id=msg["id"],
                 customer_id=msg["customer_id"],
@@ -139,46 +142,43 @@ def _process_pending_messages():
                 raw_response=result.get("raw_response", ""),
             )
 
-            # Handle high/medium intent: pre-generate reply, notify sales on Feishu
-            if result["intent_level"] in ("high", "medium"):
-                # Pre-generate suggested follow-up message with file recommendations
-                followup_result = generate_followup_message(
-                    customer_name=customer["name"],
-                    message_content=msg["content"],
-                    intent_summary=result["intent_summary"],
-                    recent_messages=recent,
-                )
-                suggested_reply = followup_result.get("message", "") if followup_result else ""
-                attachment_files = followup_result.get("recommended_files", []) if followup_result else []
+            # ── Step 2: Generate reply using RAG engine ──
+            kb_result = _check_knowledge_base(msg["content"])
 
-                # Notify admin via Feishu with suggested reply and attachments
-                success = notify_high_intent_lead(
-                    customer_name=customer["name"],
-                    customer_wechat_id=customer["wechat_user_id"],
-                    group_chat_name=customer.get("group_chat_name", ""),
-                    message_content=msg["content"],
-                    intent_level=result["intent_level"],
-                    intent_score=result["intent_score"],
-                    intent_summary=result["intent_summary"],
-                    keywords=result.get("keywords", []),
-                    suggested_reply=suggested_reply,
-                    attachment_files=attachment_files,
-                )
-                if success:
-                    mark_intent_notified(analysis_id)
+            if msg_source == "group":
+                # Group chat: always reply
+                if kb_result and kb_result["has_answer"]:
+                    reply_text = kb_result["reply"]
+                else:
+                    reply_text = _NO_ANSWER_REPLY
 
-            # Handle private chat auto-reply (only for non-high-intent messages)
-            elif msg_source == "private" and result["intent_level"] in ("low", "none"):
-                # Only auto-reply if answer exists in the knowledge base
-                kb_result = _check_knowledge_base_has_answer(msg["content"])
-                if kb_result:
-                    # Create and auto-send a follow-up with the KB answer
+                # Auto-reply, no admin approval needed
+                follow_up_id = create_follow_up(
+                    customer_id=msg["customer_id"],
+                    intent_analysis_id=analysis_id,
+                    target_user_id=customer["wechat_user_id"],
+                    reply_type="auto",
+                )
+                update_follow_up(
+                    follow_up_id,
+                    status="message_generated",
+                    generated_message=reply_text,
+                    confirmed_at=datetime.now().isoformat(),
+                )
+                logger.info(
+                    f"Auto-reply queued for group message {msg['id']} "
+                    f"from {customer['name']} (kb_match={kb_result and kb_result['has_answer']})"
+                )
+
+            elif msg_source == "private":
+                # Private chat: only reply if KB has answer
+                if kb_result and kb_result["has_answer"]:
                     follow_up_id = create_follow_up(
                         customer_id=msg["customer_id"],
                         intent_analysis_id=analysis_id,
                         target_user_id=customer["wechat_user_id"],
+                        reply_type="auto",
                     )
-                    from datetime import datetime
                     update_follow_up(
                         follow_up_id,
                         status="message_generated",
@@ -195,6 +195,52 @@ def _process_pending_messages():
                         f"from {customer['name']}, waiting for manual reply"
                     )
 
+            # ── Step 3: High/medium intent → create follow-up for sales (needs admin approval) ──
+            if result["intent_level"] in ("high", "medium"):
+                # Generate sales follow-up message with file recommendations
+                followup_result = generate_followup_message(
+                    customer_name=customer["name"],
+                    message_content=msg["content"],
+                    intent_summary=result["intent_summary"],
+                    recent_messages=recent,
+                )
+                suggested_reply = followup_result.get("message", "") if followup_result else ""
+                attachment_files = followup_result.get("recommended_files", []) if followup_result else []
+
+                # Create follow-up record, status=pending_approval (needs admin to approve)
+                fu_id = create_follow_up(
+                    customer_id=msg["customer_id"],
+                    intent_analysis_id=analysis_id,
+                    target_user_id=customer["wechat_user_id"],
+                    reply_type="follow_up",
+                )
+                update_follow_up(
+                    fu_id,
+                    status="pending_approval",
+                    generated_message=suggested_reply,
+                    attachment_files=json.dumps(attachment_files, ensure_ascii=False),
+                )
+                logger.info(
+                    f"Follow-up created (pending_approval) for message {msg['id']}, "
+                    f"intent={result['intent_level']}"
+                )
+
+                # Notify admin via Feishu
+                success = notify_high_intent_lead(
+                    customer_name=customer["name"],
+                    customer_wechat_id=customer["wechat_user_id"],
+                    group_chat_name=customer.get("group_chat_name", ""),
+                    message_content=msg["content"],
+                    intent_level=result["intent_level"],
+                    intent_score=result["intent_score"],
+                    intent_summary=result["intent_summary"],
+                    keywords=result.get("keywords", []),
+                    suggested_reply=suggested_reply,
+                    attachment_files=attachment_files,
+                )
+                if success:
+                    mark_intent_notified(analysis_id)
+
             mark_message_processed(msg["id"])
             logger.info(
                 f"Processed message {msg['id']}: intent={result['intent_level']} "
@@ -202,4 +248,3 @@ def _process_pending_messages():
             )
         except Exception as e:
             logger.error(f"Failed to process message {msg['id']}: {e}")
-            # Don't mark as processed; will retry next cycle

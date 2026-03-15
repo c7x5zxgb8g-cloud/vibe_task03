@@ -170,6 +170,11 @@ class KBChunkEditRequest(BaseModel):
     related_products: str = ""
 
 
+class TeamMemberRequest(BaseModel):
+    wechat_id: str
+    name: str = ""
+
+
 # ── API Endpoints ────────────────────────────────────────────────
 
 @app.post("/api/chat", response_model=ChatResponse)
@@ -334,6 +339,13 @@ async def webhook_receive_message(req: WebhookMessageRequest):
 
     # Optional: verify webhook secret
     # (robot can pass secret as query param or header if configured)
+
+    # Filter out messages from team members (bot + sales staff)
+    from database import get_team_member_ids
+    team_ids = get_team_member_ids()
+    if req.sender_id in team_ids:
+        logger.info(f"Ignored team member message from: {req.sender_id}")
+        return {"status": "ignored", "reason": "team_member"}
 
     customer_id = upsert_customer(
         wechat_user_id=req.sender_id,
@@ -627,6 +639,7 @@ async def admin_send_follow_up(
 @app.get("/api/admin/follow-ups")
 async def admin_list_follow_ups(
     status: str | None = None,
+    reply_type: str | None = None,
     limit: int = 50,
     offset: int = 0,
     authorization: str | None = Header(None),
@@ -635,8 +648,101 @@ async def admin_list_follow_ups(
     if not _check_admin(authorization):
         raise HTTPException(status_code=401, detail="未授权")
     from database import get_follow_ups
-    follow_ups = get_follow_ups(status=status, limit=limit, offset=offset)
+    follow_ups = get_follow_ups(status=status, reply_type=reply_type, limit=limit, offset=offset)
     return {"follow_ups": follow_ups}
+
+
+@app.post("/api/admin/follow-up/{follow_up_id}/approve")
+async def admin_approve_follow_up(
+    follow_up_id: int,
+    req: FollowUpSendRequest,
+    authorization: str | None = Header(None),
+):
+    """Admin approves a pending follow-up message for sending."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+
+    from database import get_follow_up, update_follow_up
+
+    follow_up = get_follow_up(follow_up_id)
+    if not follow_up:
+        raise HTTPException(status_code=404, detail="跟进记录不存在")
+    if follow_up["status"] != "pending_approval":
+        raise HTTPException(status_code=400, detail="该记录不在待审核状态")
+
+    message = req.message or follow_up["generated_message"]
+    if not message:
+        raise HTTPException(status_code=400, detail="消息内容不能为空")
+
+    update_follow_up(
+        follow_up_id,
+        status="message_generated",
+        generated_message=message,
+        confirmed_at=datetime.now().isoformat(),
+    )
+
+    return {"status": "ok", "message": "跟单消息已审核通过，等待机器人发送"}
+
+
+@app.post("/api/admin/follow-up/{follow_up_id}/reject")
+async def admin_reject_follow_up(
+    follow_up_id: int,
+    authorization: str | None = Header(None),
+):
+    """Admin rejects a pending follow-up message."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+
+    from database import get_follow_up, update_follow_up
+
+    follow_up = get_follow_up(follow_up_id)
+    if not follow_up:
+        raise HTTPException(status_code=404, detail="跟进记录不存在")
+
+    update_follow_up(follow_up_id, status="rejected")
+    return {"status": "ok", "message": "已驳回"}
+
+
+# ── Team Members Admin API ────────────────────────────────────
+
+
+@app.get("/api/admin/team-members")
+async def admin_list_team_members(authorization: str | None = Header(None)):
+    """List all team member wechat IDs."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import list_team_members
+    return {"team_members": list_team_members()}
+
+
+@app.post("/api/admin/team-members")
+async def admin_add_team_member(
+    req: TeamMemberRequest,
+    authorization: str | None = Header(None),
+):
+    """Add a team member wechat ID."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    if not req.wechat_id.strip():
+        raise HTTPException(status_code=400, detail="微信ID不能为空")
+    from database import add_team_member
+    member_id = add_team_member(req.wechat_id.strip(), req.name.strip())
+    if member_id is None:
+        raise HTTPException(status_code=409, detail="该微信ID已存在")
+    return {"status": "ok", "id": member_id}
+
+
+@app.delete("/api/admin/team-members/{member_id}")
+async def admin_remove_team_member(
+    member_id: int,
+    authorization: str | None = Header(None),
+):
+    """Remove a team member."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import remove_team_member
+    remove_team_member(member_id)
+    return {"status": "ok"}
 
 
 # ── Knowledge Base Admin API ──────────────────────────────────
@@ -1597,6 +1703,7 @@ _ADMIN_HTML = """\
   <div class="tab" onclick="switchTab('followups')">跟进管理</div>
   <div class="tab" onclick="switchTab('messages')">消息记录</div>
   <div class="tab" onclick="switchTab('kb')">知识库管理</div>
+  <div class="tab" onclick="switchTab('team')">团队管理</div>
 </div>
 
 <div class="content">
@@ -1632,13 +1739,14 @@ _ADMIN_HTML = """\
         <h3>跟进管理</h3>
         <div class="filter-btns">
           <button class="filter-btn active" onclick="filterFollowUps(null, this)">全部</button>
+          <button class="filter-btn" onclick="filterFollowUps('pending_approval', this)">待审核</button>
           <button class="filter-btn" onclick="filterFollowUps('message_generated', this)">待发送</button>
           <button class="filter-btn" onclick="filterFollowUps('sent', this)">已发送</button>
           <button class="filter-btn" onclick="filterFollowUps('failed', this)">失败</button>
         </div>
       </div>
       <table>
-        <thead><tr><th>客户</th><th>状态</th><th>跟进消息</th><th>更新时间</th><th>操作</th></tr></thead>
+        <thead><tr><th>客户</th><th>类型</th><th>状态</th><th>回复消息</th><th>更新时间</th><th>操作</th></tr></thead>
         <tbody id="followupsBody"></tbody>
       </table>
       <div class="empty" id="followupsEmpty" style="display:none;">暂无跟进记录</div>
@@ -1688,6 +1796,41 @@ _ADMIN_HTML = """\
     </div>
   </div>
 
+  <!-- Team Members -->
+  <div class="panel" id="panel-team">
+    <div class="card">
+      <div class="card-header">
+        <h3>团队成员（自己人微信ID）</h3>
+        <button class="btn btn-primary btn-sm" onclick="openAddTeamMember()">+ 添加成员</button>
+      </div>
+      <p style="color:#888;font-size:13px;margin:0 0 12px;">列表中的微信ID发送的消息将被自动忽略，不保存、不回复。</p>
+      <table>
+        <thead><tr><th>微信ID</th><th>备注名</th><th>添加时间</th><th>操作</th></tr></thead>
+        <tbody id="teamBody"></tbody>
+      </table>
+      <div class="empty" id="teamEmpty" style="display:none;">暂无团队成员</div>
+    </div>
+  </div>
+
+</div>
+
+<!-- Add team member modal -->
+<div class="modal-overlay" id="addTeamModal">
+  <div class="modal">
+    <h3>添加团队成员</h3>
+    <div style="margin-bottom:12px">
+      <label style="display:block;margin-bottom:4px;font-weight:600;font-size:13px">微信ID</label>
+      <input type="text" id="teamWechatId" placeholder="例如: wxid_abc123" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+    </div>
+    <div style="margin-bottom:16px">
+      <label style="display:block;margin-bottom:4px;font-weight:600;font-size:13px">备注名称</label>
+      <input type="text" id="teamMemberName" placeholder="例如: 张销售" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:6px;">
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end">
+      <button class="btn" onclick="closeModal('addTeamModal')">取消</button>
+      <button class="btn btn-primary" id="addTeamBtn" onclick="doAddTeamMember()">添加</button>
+    </div>
+  </div>
 </div>
 
 <!-- Chunk review modal -->
@@ -1839,7 +1982,7 @@ async function apiFetch(url, method = 'GET', body = null) {
 }
 
 function switchTab(name) {
-  const tabNames = { dashboard: '仪表盘', leads: '客户线索', followups: '跟进管理', messages: '消息记录', kb: '知识库管理' };
+  const tabNames = { dashboard: '仪表盘', leads: '客户线索', followups: '跟进管理', messages: '消息记录', kb: '知识库管理', team: '团队管理' };
   document.querySelectorAll('.tab').forEach(t => {
     t.classList.toggle('active', t.textContent.includes(tabNames[name] || ''));
   });
@@ -1851,6 +1994,7 @@ function switchTab(name) {
   else if (name === 'followups') loadFollowUps();
   else if (name === 'messages') loadMessages();
   else if (name === 'kb') loadKBDocuments();
+  else if (name === 'team') loadTeamMembers();
 }
 
 // Dashboard
@@ -1929,8 +2073,10 @@ async function loadFollowUps(status = null) {
           ).join('') + '</div>';
         }
       } catch(e) {}
+      const typeLabel = f.reply_type === 'follow_up' ? '<span style="color:#e67e22;font-weight:600">跟单</span>' : '<span style="color:#27ae60">自动</span>';
       return `<tr>
       <td><strong>${esc(f.customer_name)}</strong></td>
+      <td>${typeLabel}</td>
       <td><span class="badge ${f.status}">${statusLabel(f.status)}</span></td>
       <td><div class="text-truncate">${esc(f.generated_message || '-')}${filesHtml}</div></td>
       <td class="text-muted">${formatTime(f.updated_at)}</td>
@@ -2061,7 +2207,10 @@ async function doSendFollowUp() {
 }
 
 function renderFollowUpAction(f) {
-  if (f.status === 'message_generated') {
+  if (f.status === 'pending_approval') {
+    return '<button class="btn btn-primary btn-sm" onclick="openApprove(' + f.id + ')" style="margin-right:4px">审核通过</button>'
+         + '<button class="btn btn-sm" style="background:#f5f5f5;color:#e74c3c;border:1px solid #ddd;" onclick="rejectFollowUp(' + f.id + ')">驳回</button>';
+  } else if (f.status === 'message_generated') {
     return '<button class="btn btn-success btn-sm" onclick="openSendById(' + f.id + ')">编辑发送</button>';
   } else if (f.status === 'failed') {
     return '<span class="text-muted">' + esc(f.error_message || '发送失败') + '</span>';
@@ -2092,12 +2241,118 @@ function levelLabel(l) {
   return { high: '高意向', medium: '中意向', low: '低意向', none: '无意向' }[l] || l;
 }
 function statusLabel(s) {
-  return { pending: '待处理', confirmed: '已确认', message_generated: '待发送', sent: '已发送', failed: '失败' }[s] || s;
+  return { pending: '待处理', confirmed: '已确认', pending_approval: '待审核', message_generated: '待发送', sent: '已发送', failed: '失败', rejected: '已驳回' }[s] || s;
 }
 function formatTime(t) {
   if (!t) return '-';
   try { return new Date(t).toLocaleString('zh-CN', { month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit' }); }
   catch(e) { return t; }
+}
+
+// ── Follow-up Approval ────────────────────────────────────
+
+function openApprove(followUpId) {
+  const f = _followUpCache[followUpId];
+  if (!f) return;
+  pendingFollowUpId = followUpId;
+  let filesInfo = '';
+  try {
+    const files = JSON.parse(f.attachment_files || '[]');
+    if (files.length > 0) {
+      filesInfo = '<p style="margin-top:8px;color:#666">附带文件：' + files.map(fn =>
+        `<a href="/api/materials/${encodeURIComponent(fn)}" target="_blank" style="color:#1a73e8">📎${esc(fn)}</a>`
+      ).join('  ') + '</p>';
+    }
+  } catch(e) {}
+  document.getElementById('sendCustomerInfo').innerHTML = '<p>跟单消息审核 - 客户: <strong>' + esc(f.customer_name) + '</strong></p><p style="color:#e67e22;font-size:12px">此为跟单消息，需审核后才会发送</p>' + filesInfo;
+  document.getElementById('sendMessage').value = f.generated_message || '';
+  document.getElementById('sendModal').classList.add('show');
+  // Override send button to do approve
+  document.getElementById('sendBtn').onclick = doApproveFollowUp;
+  document.getElementById('sendBtn').textContent = '审核通过并发送';
+}
+
+async function doApproveFollowUp() {
+  const msg = document.getElementById('sendMessage').value.trim();
+  if (!msg) { alert('消息不能为空'); return; }
+  const btn = document.getElementById('sendBtn');
+  btn.disabled = true;
+  try {
+    await apiFetch('/api/admin/follow-up/' + pendingFollowUpId + '/approve', 'POST', { follow_up_id: pendingFollowUpId, message: msg });
+    closeModal('sendModal');
+    alert('跟单消息已审核通过，等待机器人发送');
+    loadFollowUps(currentFUFilter);
+  } catch(e) {
+    alert('操作失败: ' + e.message);
+  }
+  btn.disabled = false;
+  // Restore original handler
+  btn.onclick = doSendFollowUp;
+  btn.textContent = '确认发送';
+}
+
+async function rejectFollowUp(followUpId) {
+  if (!confirm('确定驳回该跟单消息？')) return;
+  try {
+    await apiFetch('/api/admin/follow-up/' + followUpId + '/reject', 'POST');
+    loadFollowUps(currentFUFilter);
+  } catch(e) {
+    alert('操作失败: ' + e.message);
+  }
+}
+
+// ── Team Member Management ────────────────────────────────
+
+async function loadTeamMembers() {
+  try {
+    const d = await apiFetch('/api/admin/team-members');
+    const body = document.getElementById('teamBody');
+    const empty = document.getElementById('teamEmpty');
+    if (!d.team_members || d.team_members.length === 0) {
+      body.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    body.innerHTML = d.team_members.map(m => `<tr>
+      <td><code>${esc(m.wechat_id)}</code></td>
+      <td>${esc(m.name)}</td>
+      <td class="text-muted">${formatTime(m.created_at)}</td>
+      <td><button class="btn btn-sm" style="background:#fee;color:#e74c3c;border:1px solid #fcc;" onclick="removeTeamMember(${m.id}, '${escJs(m.wechat_id)}')">删除</button></td>
+    </tr>`).join('');
+  } catch(e) {}
+}
+
+function openAddTeamMember() {
+  document.getElementById('teamWechatId').value = '';
+  document.getElementById('teamMemberName').value = '';
+  document.getElementById('addTeamModal').classList.add('show');
+}
+
+async function doAddTeamMember() {
+  const wechatId = document.getElementById('teamWechatId').value.trim();
+  const name = document.getElementById('teamMemberName').value.trim();
+  if (!wechatId) { alert('微信ID不能为空'); return; }
+  const btn = document.getElementById('addTeamBtn');
+  btn.disabled = true;
+  try {
+    await apiFetch('/api/admin/team-members', 'POST', { wechat_id: wechatId, name: name || wechatId });
+    closeModal('addTeamModal');
+    loadTeamMembers();
+  } catch(e) {
+    alert('添加失败: ' + (e.message || '该微信ID可能已存在'));
+  }
+  btn.disabled = false;
+}
+
+async function removeTeamMember(id, wechatId) {
+  if (!confirm('确定删除团队成员 ' + wechatId + '？\\n删除后该成员的消息将不再被忽略。')) return;
+  try {
+    await apiFetch('/api/admin/team-members/' + id, 'DELETE');
+    loadTeamMembers();
+  } catch(e) {
+    alert('删除失败: ' + e.message);
+  }
 }
 
 // ── Knowledge Base Management ─────────────────────────────

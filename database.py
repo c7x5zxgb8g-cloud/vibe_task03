@@ -58,6 +58,7 @@ CREATE TABLE IF NOT EXISTS follow_ups (
     id                  INTEGER PRIMARY KEY AUTOINCREMENT,
     customer_id         INTEGER NOT NULL REFERENCES customers(id),
     intent_analysis_id  INTEGER REFERENCES intent_analyses(id),
+    reply_type          TEXT NOT NULL DEFAULT 'auto',
     status              TEXT NOT NULL DEFAULT 'pending',
     generated_message   TEXT NOT NULL DEFAULT '',
     attachment_files    TEXT NOT NULL DEFAULT '[]',
@@ -72,6 +73,13 @@ CREATE TABLE IF NOT EXISTS follow_ups (
 );
 CREATE INDEX IF NOT EXISTS idx_followup_customer ON follow_ups(customer_id);
 CREATE INDEX IF NOT EXISTS idx_followup_status ON follow_ups(status);
+
+CREATE TABLE IF NOT EXISTS team_members (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    wechat_id       TEXT NOT NULL UNIQUE,
+    name            TEXT NOT NULL DEFAULT '',
+    created_at      TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS kb_documents (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,15 +126,32 @@ def get_connection() -> sqlite3.Connection:
 def init_db():
     conn = get_connection()
     conn.executescript(_SCHEMA_SQL)
-    # Migration: add attachment_files column if missing
+    # Migrations for follow_ups table
     try:
         cols = [row[1] for row in conn.execute("PRAGMA table_info(follow_ups)").fetchall()]
         if "attachment_files" not in cols:
             conn.execute("ALTER TABLE follow_ups ADD COLUMN attachment_files TEXT NOT NULL DEFAULT '[]'")
             conn.commit()
             logger.info("Migrated follow_ups: added attachment_files column")
+        if "reply_type" not in cols:
+            conn.execute("ALTER TABLE follow_ups ADD COLUMN reply_type TEXT NOT NULL DEFAULT 'auto'")
+            conn.commit()
+            logger.info("Migrated follow_ups: added reply_type column")
     except Exception as e:
         logger.warning(f"Migration check failed: {e}")
+
+    # Seed team members from config
+    from config import Config
+    if Config.WECHAT_TEAM_IDS:
+        for wid in Config.WECHAT_TEAM_IDS:
+            try:
+                conn.execute(
+                    "INSERT OR IGNORE INTO team_members (wechat_id, name, created_at) VALUES (?, ?, ?)",
+                    (wid, wid, datetime.now().isoformat())
+                )
+            except Exception:
+                pass
+        conn.commit()
     conn.close()
     logger.info(f"Database initialized at {_DB_PATH}")
 
@@ -320,13 +345,18 @@ def get_high_intent_leads(intent_level: str | None = None,
 
 
 def create_follow_up(customer_id: int, intent_analysis_id: int | None = None,
-                     target_user_id: str = "", target_group_id: str = "") -> int:
+                     target_user_id: str = "", target_group_id: str = "",
+                     reply_type: str = "auto") -> int:
+    """Create a follow-up record.
+
+    reply_type: 'auto' for normal KB auto-replies, 'follow_up' for sales follow-up (needs admin approval).
+    """
     now = datetime.now().isoformat()
     conn = get_connection()
     try:
         cur = conn.execute(
-            "INSERT INTO follow_ups (customer_id, intent_analysis_id, target_user_id, target_group_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
-            (customer_id, intent_analysis_id, target_user_id, target_group_id, "pending", now, now)
+            "INSERT INTO follow_ups (customer_id, intent_analysis_id, reply_type, target_user_id, target_group_id, status, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?)",
+            (customer_id, intent_analysis_id, reply_type, target_user_id, target_group_id, "pending", now, now)
         )
         conn.commit()
         return cur.lastrowid
@@ -360,7 +390,8 @@ def get_follow_up(follow_up_id: int) -> dict | None:
         conn.close()
 
 
-def get_follow_ups(status: str | None = None, limit: int = 50, offset: int = 0) -> list[dict]:
+def get_follow_ups(status: str | None = None, reply_type: str | None = None,
+                   limit: int = 50, offset: int = 0) -> list[dict]:
     conn = get_connection()
     try:
         sql = """
@@ -372,6 +403,9 @@ def get_follow_ups(status: str | None = None, limit: int = 50, offset: int = 0) 
         if status:
             sql += " AND f.status=?"
             params.append(status)
+        if reply_type:
+            sql += " AND f.reply_type=?"
+            params.append(reply_type)
         sql += " ORDER BY f.updated_at DESC LIMIT ? OFFSET ?"
         params.extend([limit, offset])
         rows = conn.execute(sql, params).fetchall()
@@ -563,6 +597,54 @@ def update_kb_chunk(chunk_id: int, **kwargs):
             f"UPDATE kb_chunks SET {', '.join(set_parts)} WHERE id=?",
             values
         )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+# ── Team Members CRUD ─────────────────────────────────────────
+
+
+def get_team_member_ids() -> set[str]:
+    """Return set of all team member wechat IDs."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT wechat_id FROM team_members").fetchall()
+        return {r["wechat_id"] for r in rows}
+    finally:
+        conn.close()
+
+
+def list_team_members() -> list[dict]:
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT * FROM team_members ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+    finally:
+        conn.close()
+
+
+def add_team_member(wechat_id: str, name: str = "") -> int | None:
+    """Add a team member. Returns id or None if duplicate."""
+    conn = get_connection()
+    try:
+        existing = conn.execute("SELECT id FROM team_members WHERE wechat_id=?", (wechat_id,)).fetchone()
+        if existing:
+            return None
+        cur = conn.execute(
+            "INSERT INTO team_members (wechat_id, name, created_at) VALUES (?,?,?)",
+            (wechat_id, name or wechat_id, datetime.now().isoformat())
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def remove_team_member(member_id: int):
+    conn = get_connection()
+    try:
+        conn.execute("DELETE FROM team_members WHERE id=?", (member_id,))
         conn.commit()
     finally:
         conn.close()

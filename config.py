@@ -31,6 +31,11 @@ class Config:
     # Feishu Webhook
     FEISHU_WEBHOOK_URL: str = os.getenv("FEISHU_WEBHOOK_URL", "")
 
+    # WeChat team member IDs (comma-separated in .env, e.g. "wxid_bot,wxid_sales1,wxid_sales2")
+    WECHAT_TEAM_IDS: list[str] = [
+        s.strip() for s in os.getenv("WECHAT_TEAM_IDS", "").split(",") if s.strip()
+    ]
+
     # Admin
     ADMIN_BASE_URL: str = os.getenv("ADMIN_BASE_URL", "http://localhost:8000")
     ADMIN_PASSWORD: str = os.getenv("ADMIN_PASSWORD", "admin123")
