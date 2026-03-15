@@ -1656,6 +1656,8 @@ _ADMIN_HTML = """\
   .btn-primary:hover { background: #1a3a5c; }
   .btn-success { background: #2e7d32; color: #fff; }
   .btn-success:hover { background: #1b5e20; }
+  .btn-danger { background: #e74c3c; color: #fff; }
+  .btn-danger:hover { background: #c0392b; }
   .btn-sm { padding: 3px 10px; font-size: 11px; }
 
   .text-truncate { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -1795,9 +1797,10 @@ _ADMIN_HTML = """\
     <div class="card">
       <div class="card-header">
         <h3>消息记录</h3>
+        <button class="btn btn-danger" onclick="clearAllMessages()" style="margin-left:auto;">清空全部</button>
       </div>
       <table>
-        <thead><tr><th>客户</th><th>群</th><th>内容</th><th>时间</th></tr></thead>
+        <thead><tr><th>客户</th><th>群</th><th>内容</th><th>时间</th><th>操作</th></tr></thead>
         <tbody id="messagesBody"></tbody>
       </table>
       <div class="empty" id="messagesEmpty" style="display:none;">暂无消息记录</div>
@@ -2147,8 +2150,26 @@ async function loadMessages() {
       <td class="text-muted">${esc(m.group_chat_id || '-')}</td>
       <td><div class="text-truncate">${esc(m.content)}</div></td>
       <td class="text-muted">${formatTime(m.received_at)}</td>
+      <td><button class="btn btn-danger btn-sm" onclick="deleteMessage(${m.id})">删除</button></td>
     </tr>`).join('');
   } catch(e) {}
+}
+
+async function deleteMessage(msgId) {
+  if (!confirm('确定要删除这条消息吗？相关的意向分析和跟进记录也会被删除。')) return;
+  try {
+    await apiFetch('/api/admin/messages/' + msgId, { method: 'DELETE' });
+    loadMessages();
+  } catch(e) { alert('删除失败: ' + e.message); }
+}
+
+async function clearAllMessages() {
+  if (!confirm('确定要清空所有消息记录吗？此操作不可恢复，所有消息、意向分析和相关跟进记录都会被删除。')) return;
+  try {
+    const d = await apiFetch('/api/admin/messages', { method: 'DELETE' });
+    alert(d.message || '已清空');
+    loadMessages();
+  } catch(e) { alert('清空失败: ' + e.message); }
 }
 
 // Detail
