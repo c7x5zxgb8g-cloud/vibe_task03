@@ -2158,7 +2158,7 @@ async function loadMessages() {
 async function deleteMessage(msgId) {
   if (!confirm('确定要删除这条消息吗？相关的意向分析和跟进记录也会被删除。')) return;
   try {
-    await apiFetch('/api/admin/messages/' + msgId, { method: 'DELETE' });
+    await apiFetch('/api/admin/messages/' + msgId, 'DELETE');
     loadMessages();
   } catch(e) { alert('删除失败: ' + e.message); }
 }
@@ -2166,7 +2166,7 @@ async function deleteMessage(msgId) {
 async function clearAllMessages() {
   if (!confirm('确定要清空所有消息记录吗？此操作不可恢复，所有消息、意向分析和相关跟进记录都会被删除。')) return;
   try {
-    const d = await apiFetch('/api/admin/messages', { method: 'DELETE' });
+    const d = await apiFetch('/api/admin/messages', 'DELETE');
     alert(d.message || '已清空');
     loadMessages();
   } catch(e) { alert('清空失败: ' + e.message); }
