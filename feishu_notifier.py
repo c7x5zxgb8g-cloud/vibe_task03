@@ -25,7 +25,14 @@ def notify_high_intent_lead(
 
     Returns True if sent successfully.
     """
-    webhook_url = Config.FEISHU_WEBHOOK_URL
+    # Priority: DB setting > env variable
+    try:
+        from database import get_setting
+        webhook_url = get_setting("feishu_webhook_url", "")
+    except Exception:
+        webhook_url = ""
+    if not webhook_url:
+        webhook_url = Config.FEISHU_WEBHOOK_URL
     if not webhook_url:
         logger.warning("Feishu webhook URL not configured, skipping notification")
         return False

@@ -81,6 +81,12 @@ CREATE TABLE IF NOT EXISTS team_members (
     created_at      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS system_settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL DEFAULT '',
+    updated_at  TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS kb_documents (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     file_name       TEXT NOT NULL,
@@ -765,5 +771,43 @@ def get_kb_document_stats() -> dict:
             "ready_documents": ready_docs,
             "total_chunks": total_chunks,
         }
+    finally:
+        conn.close()
+
+
+# ── System Settings CRUD ─────────────────────────────────────
+
+
+def get_setting(key: str, default: str = "") -> str:
+    """Get a single setting value by key."""
+    conn = get_connection()
+    try:
+        row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+    finally:
+        conn.close()
+
+
+def set_setting(key: str, value: str):
+    """Upsert a single setting."""
+    now = datetime.now().isoformat()
+    conn = get_connection()
+    try:
+        conn.execute(
+            "INSERT INTO system_settings (key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (key, value, now)
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_all_settings() -> dict:
+    """Get all settings as a dict."""
+    conn = get_connection()
+    try:
+        rows = conn.execute("SELECT key, value FROM system_settings").fetchall()
+        return {r["key"]: r["value"] for r in rows}
     finally:
         conn.close()

@@ -789,6 +789,44 @@ async def admin_remove_team_member(
     return {"status": "ok"}
 
 
+# ── System Settings API ────────────────────────────────────────
+
+
+@app.get("/api/admin/settings")
+async def admin_get_settings(authorization: str | None = Header(None)):
+    """Get all system settings."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import get_all_settings
+    settings = get_all_settings()
+    # Merge with env defaults so frontend always sees all known keys
+    defaults = {
+        "feishu_webhook_url": Config.FEISHU_WEBHOOK_URL,
+    }
+    for k, v in defaults.items():
+        if k not in settings:
+            settings[k] = v
+    return {"settings": settings}
+
+
+@app.post("/api/admin/settings")
+async def admin_save_settings(
+    req: dict,
+    authorization: str | None = Header(None),
+):
+    """Save system settings (key-value pairs)."""
+    if not _check_admin(authorization):
+        raise HTTPException(status_code=401, detail="未授权")
+    from database import set_setting
+    allowed_keys = {"feishu_webhook_url"}
+    saved = []
+    for k, v in req.items():
+        if k in allowed_keys:
+            set_setting(k, str(v))
+            saved.append(k)
+    return {"status": "ok", "saved": saved}
+
+
 # ── Knowledge Base Admin API ──────────────────────────────────
 
 
@@ -1750,6 +1788,7 @@ _ADMIN_HTML = """\
   <div class="tab" onclick="switchTab('messages')">消息记录</div>
   <div class="tab" onclick="switchTab('kb')">知识库管理</div>
   <div class="tab" onclick="switchTab('team')">团队管理</div>
+  <div class="tab" onclick="switchTab('settings')">系统设置</div>
 </div>
 
 <div class="content">
@@ -1856,6 +1895,27 @@ _ADMIN_HTML = """\
         <tbody id="teamBody"></tbody>
       </table>
       <div class="empty" id="teamEmpty" style="display:none;">暂无团队成员</div>
+    </div>
+  </div>
+
+  <!-- Settings -->
+  <div class="panel" id="panel-settings">
+    <div class="card">
+      <div class="card-header">
+        <h3>系统设置</h3>
+      </div>
+      <div style="padding:20px;">
+        <div style="margin-bottom:20px;">
+          <label style="display:block;margin-bottom:6px;font-weight:600;font-size:14px;color:#333;">飞书 Webhook 地址</label>
+          <p style="font-size:12px;color:#999;margin-bottom:8px;">用于推送高意向客户提醒到飞书群。留空则不推送。</p>
+          <input type="text" id="settingFeishuUrl" placeholder="https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx" style="width:100%;max-width:600px;padding:10px 14px;border:1.5px solid #dde3ea;border-radius:8px;font-size:13px;outline:none;font-family:inherit;">
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;">
+          <button class="btn btn-primary" onclick="saveSystemSettings()">保存设置</button>
+          <button class="btn" style="background:#e3f2fd;color:#1565c0;border:1px solid #bbdefb;" onclick="testFeishu()">测试飞书通知</button>
+          <span id="settingsSaveStatus" style="font-size:13px;color:#2e7d32;display:none;">已保存</span>
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2029,7 +2089,7 @@ async function apiFetch(url, method = 'GET', body = null) {
 }
 
 function switchTab(name) {
-  const tabNames = { dashboard: '仪表盘', leads: '客户线索', followups: '跟进管理', messages: '消息记录', kb: '知识库管理', team: '团队管理' };
+  const tabNames = { dashboard: '仪表盘', leads: '客户线索', followups: '跟进管理', messages: '消息记录', kb: '知识库管理', team: '团队管理', settings: '系统设置' };
   document.querySelectorAll('.tab').forEach(t => {
     t.classList.toggle('active', t.textContent.includes(tabNames[name] || ''));
   });
@@ -2042,6 +2102,7 @@ function switchTab(name) {
   else if (name === 'messages') loadMessages();
   else if (name === 'kb') loadKBDocuments();
   else if (name === 'team') loadTeamMembers();
+  else if (name === 'settings') loadSystemSettings();
 }
 
 // Dashboard
@@ -2655,6 +2716,58 @@ async function doDeleteDoc(docId) {
     await apiFetch('/api/admin/kb/documents/' + docId, 'DELETE');
     loadKBDocuments(currentKBFilter);
   } catch(e) { alert('删除失败: ' + e.message); }
+}
+
+// ── System Settings ─────────────────────────────────────
+
+async function loadSystemSettings() {
+  try {
+    const d = await apiFetch('/api/admin/settings');
+    const s = d.settings || {};
+    document.getElementById('settingFeishuUrl').value = s.feishu_webhook_url || '';
+  } catch(e) {}
+}
+
+async function saveSystemSettings() {
+  const feishuUrl = document.getElementById('settingFeishuUrl').value.trim();
+  try {
+    await apiFetch('/api/admin/settings', 'POST', {
+      feishu_webhook_url: feishuUrl
+    });
+    const tip = document.getElementById('settingsSaveStatus');
+    tip.textContent = '已保存';
+    tip.style.color = '#2e7d32';
+    tip.style.display = 'inline';
+    setTimeout(function() { tip.style.display = 'none'; }, 3000);
+  } catch(e) { alert('保存失败: ' + e.message); }
+}
+
+async function testFeishu() {
+  const feishuUrl = document.getElementById('settingFeishuUrl').value.trim();
+  if (!feishuUrl) { alert('请先填写飞书 Webhook 地址'); return; }
+  // Save first, then trigger a test
+  await saveSystemSettings();
+  try {
+    const res = await fetch(feishuUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        msg_type: 'text',
+        content: { text: '理博基金客服系统 - 飞书通知测试成功！' }
+      })
+    });
+    if (res.ok) {
+      const tip = document.getElementById('settingsSaveStatus');
+      tip.textContent = '测试消息已发送，请检查飞书群';
+      tip.style.color = '#1565c0';
+      tip.style.display = 'inline';
+      setTimeout(function() { tip.style.display = 'none'; }, 5000);
+    } else {
+      alert('测试失败: HTTP ' + res.status);
+    }
+  } catch(e) {
+    alert('测试失败: ' + e.message + '\\n（如遇跨域问题，可在服务器日志中查看飞书通知是否正常工作）');
+  }
 }
 </script>
 </body>
